@@ -507,14 +507,24 @@ function finaliseItem(current) {
   };
 }
 
-// Collapse whitespace to PascalCase-ish slug so the parts split on "_" cleanly.
-// "Ruby Garden" → "RubyGarden". Strips anything not [A-Za-z0-9].
+// Turn free text into a filename-safe slug that still round-trips back to
+// human-readable text via the frontend's titleCase() (which splits on `-`,
+// `_`, and spaces).
+//
+// We use `-` as the internal word separator (NOT `_`, because `_` is the
+// outer part separator between Name / Category / Detail).
+//
+//   "Ruby Garden"  → "Ruby-Garden"   → card shows "Ruby Garden"
+//   "42 Plots"     → "42-Plots"      → badge shows "42 Plots"
+//   "Ruby_Garden"  → "Ruby-Garden"   (user's underscores normalised)
+//   "Sky's End"    → "Skys-End"      (strips punctuation, keeps hyphen)
 function slug(raw) {
   return raw
-    .split(/\s+/)
-    .map(w => w.charAt(0).toUpperCase() + w.slice(1))
-    .join('')
-    .replace(/[^A-Za-z0-9]/g, '');
+    .replace(/[^A-Za-z0-9\s_-]+/g, '') // drop punctuation
+    .split(/[\s_-]+/)                   // split on whitespace / _ / -
+    .filter(Boolean)
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join('-');
 }
 
 function formatItem(item) {
