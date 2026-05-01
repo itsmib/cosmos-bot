@@ -47,6 +47,11 @@ const NO_TOKENS   = ['no', 'n', 'cancel', 'skip'];
 const SESSIONS = new Map();
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30 min idle → session stale
 
+// Per-chat token → filename map for /delete inline buttons.
+// Filenames can exceed Telegram's 64-byte callback_data limit, so we send a
+// short token and look up the real filename here when the button is tapped.
+const DELETE_TOKENS = new Map();
+
 // Dedup Telegram retries.
 const SEEN_UPDATES = new Set();
 const SEEN_MAX = 200;
@@ -72,6 +77,11 @@ module.exports = async (req, res) => {
       }
     }
 
+    if (body.callback_query) {
+      await handleCallbackQuery(body.callback_query);
+      return res.status(200).send('ok');
+    }
+
     const message = body.message;
     if (!message) return res.status(200).send('ok');
 
@@ -85,7 +95,7 @@ module.exports = async (req, res) => {
     }
     if (text.startsWith('/cancel')) {
       SESSIONS.delete(chatId);
-      await sendMessage(chatId, 'Cancelled. Session cleared.');
+      await sendMessage(chatId, 'All clear, Sharik. Send an image whenever you\'re ready to list a property.');
       return res.status(200).send('ok');
     }
     if (text.startsWith('/list')) {
@@ -140,9 +150,9 @@ async function routeMessage(chatId, message, text) {
     session.step = 'name';
     touch(session);
     await sendMessage(chatId,
-      `Got it. Let's fill in the details.\n\n` +
+      `Got the image, Sharik. Let's list this property.\n\n` +
       `1/4  What's the **property name**?  (e.g. Ruby Garden)\n\n` +
-      `Send /cancel to abort.`
+      `Send /cancel anytime to drop this one.`
     );
     return;
   }
@@ -183,11 +193,12 @@ async function onName(chatId, session, text) {
   session.step = 'category';
   touch(session);
   await sendMessage(chatId,
-    `2/4  Which **section**?  Reply with one:\n` +
-    `  • Ongoing\n` +
-    `  • Karaikal\n` +
-    `  • Chennai\n` +
-    `  • Other`
+    `Nice — *${cleaned}*.\n\n` +
+    `2/4  Which **section** does it go under?  Reply with one:\n` +
+    `  • Ongoing — currently under development\n` +
+    `  • Karaikal — completed Karaikal projects\n` +
+    `  • Chennai — completed Chennai projects\n` +
+    `  • Other — anything else`
   );
 }
 
@@ -204,9 +215,9 @@ async function onCategory(chatId, session, text) {
   session.step = 'location';
   touch(session);
   await sendMessage(chatId,
-    `3/4  **Location** to display on the card?  (optional)\n\n` +
-    `Useful for Ongoing cards so viewers see the city.\n` +
-    `Reply with a city name, or send "skip" to use "${match}".`
+    `3/4  **Location** to show on the card?  (optional)\n\n` +
+    `Helpful for Ongoing listings so buyers spot the city at a glance.\n` +
+    `Reply with the city, or send "skip" to keep it as just *${match}*.`
   );
 }
 
@@ -228,7 +239,8 @@ async function onLocation(chatId, session, text) {
   touch(session);
   await sendMessage(chatId,
     `4/4  **Badge text**?  (optional)\n\n` +
-    `Shown as a small crimson pill on the card, e.g. "42 Plots".\n` +
+    `Shown as a small crimson pill on the card — great for selling points\n` +
+    `like "42 Plots", "Sold Out", or "Phase 2".\n` +
     `Reply with the text, or send "skip" for no badge.`
   );
 }
@@ -256,11 +268,11 @@ async function onDetail(chatId, session, text) {
   touch(session);
 
   await sendMessage(chatId,
-    `✓ Queued #${session.queue.length}:\n` +
+    `✓ Queued property #${session.queue.length}:\n` +
     formatItem(item) + '\n\n' +
     `Send another image to add more, or reply:\n` +
-    `  yes  → commit everything now\n` +
-    `  no   → cancel all queued items`
+    `  yes  → publish everything to the site\n` +
+    `  no   → drop all queued items`
   );
 }
 
@@ -272,13 +284,13 @@ async function onMore(chatId, session, text) {
   }
   if (NO_TOKENS.includes(lc)) {
     SESSIONS.delete(chatId);
-    await sendMessage(chatId, 'All queued items discarded. Session cleared.');
+    await sendMessage(chatId, 'No worries Sharik — queue cleared. Send an image whenever you\'re ready.');
     return;
   }
   await sendMessage(chatId,
-    `Not sure what you meant. Send another image to queue more,\n` +
-    `or reply "yes" to commit, "no" to cancel.\n\n` +
-    `/queue to review what's queued.`
+    `Didn't catch that, Sharik. Send another image to queue more,\n` +
+    `or reply "yes" to publish, "no" to discard.\n\n` +
+    `/queue to review what's lined up.`
   );
 }
 
@@ -289,11 +301,11 @@ async function onMore(chatId, session, text) {
 async function handleCommit(chatId) {
   const session = SESSIONS.get(chatId);
   if (!session || session.queue.length === 0) {
-    await sendMessage(chatId, 'Nothing queued. Send an image to start.');
+    await sendMessage(chatId, 'Nothing queued, Sharik. Send a property image to get started.');
     return;
   }
 
-  await sendMessage(chatId, `Committing ${session.queue.length} item${session.queue.length === 1 ? '' : 's'}...`);
+  await sendMessage(chatId, `Publishing ${session.queue.length} propert${session.queue.length === 1 ? 'y' : 'ies'} to the site, Sharik...`);
 
   const results = [];
   for (const item of session.queue) {
@@ -309,7 +321,7 @@ async function handleCommit(chatId) {
   SESSIONS.delete(chatId);
   await sendMessage(chatId,
     results.join('\n') + '\n\n' +
-    `Vercel is deploying — site updates in ~60s.`
+    `Done, Sharik. Vercel is deploying — your site will reflect this in ~60s.`
   );
 }
 
@@ -355,15 +367,15 @@ async function commitItem(item) {
 async function handleQueue(chatId) {
   const session = SESSIONS.get(chatId);
   if (!session || session.queue.length === 0) {
-    await sendMessage(chatId, 'Queue is empty.');
+    await sendMessage(chatId, 'Queue is empty, Sharik. Send a property image to start.');
     return;
   }
-  const lines = [`Queued (${session.queue.length}):`];
+  const lines = [`Lined up for publishing (${session.queue.length}):`];
   session.queue.forEach((item, i) => {
     lines.push('', `${i + 1}. ${item.filename}`);
     lines.push(`   ${item.name} · ${item.category}${item.location ? ' · ' + item.location : ''}${item.detail ? ' · ' + item.detail : ''}`);
   });
-  lines.push('', 'Reply "yes" to commit, "no" to cancel, or send another image.');
+  lines.push('', 'Reply "yes" to publish, "no" to discard, or send another image.');
   await sendMessage(chatId, lines.join('\n'));
 }
 
@@ -381,7 +393,7 @@ async function handleList(chatId) {
     entries = Array.isArray(r.data) ? r.data : [];
   } catch (e) {
     if (e?.response?.status === 404) {
-      await sendMessage(chatId, 'No projects yet — the folder is empty.');
+      await sendMessage(chatId, 'No projects live yet, Sharik — the showcase is empty.');
       return;
     }
     throw e;
@@ -389,7 +401,7 @@ async function handleList(chatId) {
 
   const files = entries.filter(e => e.type === 'file');
   if (files.length === 0) {
-    await sendMessage(chatId, 'No projects yet — the folder is empty.');
+    await sendMessage(chatId, 'No projects live yet, Sharik — the showcase is empty.');
     return;
   }
 
@@ -408,14 +420,14 @@ async function handleList(chatId) {
     ['_',        'Unparseable'],
   ];
 
-  const lines = [`${files.length} project image${files.length === 1 ? '' : 's'}:`];
+  const lines = [`Sharik, you've got ${files.length} propert${files.length === 1 ? 'y' : 'ies'} live on the site:`];
   for (const [key, label] of sections) {
     const arr = buckets[key];
     if (!arr || arr.length === 0) continue;
     lines.push('', `${label} (${arr.length}):`);
     for (const name of arr.sort()) lines.push(`  ${name}`);
   }
-  lines.push('', `Delete with: /delete Filename.jpg`);
+  lines.push('', `Use /delete to pick one to remove.`);
   await sendMessage(chatId, lines.join('\n'));
 }
 
@@ -424,25 +436,138 @@ async function handleList(chatId) {
 // ---------------------------------------------------------------------------
 
 async function handleDelete(chatId, text) {
-  const m = text.match(/^\/delete(?:@\S+)?\s+(.+?)\s*$/i);
-  if (!m) {
-    await sendMessage(chatId,
-      `Usage: /delete Filename.jpg\n\n` +
-      `Tip: use /list to see exact filenames.`
-    );
+  const m = text.match(/^\/delete(?:@\S+)?(?:\s+(.+?))?\s*$/i);
+  const arg = m && m[1] ? m[1].trim() : '';
+
+  // No argument → show inline button list of live files.
+  if (!arg) {
+    await showDeleteMenu(chatId);
     return;
   }
-  const filename = m[1].trim();
 
-  if (filename.includes('/') || filename.includes('..')) {
-    await sendMessage(chatId, 'Filename must be a plain filename.');
+  // Legacy path: /delete Filename.jpg still works.
+  await deleteFile(chatId, arg);
+}
+
+async function showDeleteMenu(chatId) {
+  let entries;
+  try {
+    const r = await axios.get(
+      `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GH_CONTENTS_PATH}`,
+      { headers: ghHeaders(), params: { ref: GITHUB_BRANCH } }
+    );
+    entries = Array.isArray(r.data) ? r.data : [];
+  } catch (e) {
+    if (e?.response?.status === 404) {
+      await sendMessage(chatId, 'No live properties to delete, Sharik.');
+      return;
+    }
+    throw e;
+  }
+
+  const files = entries.filter(e => e.type === 'file').sort((a, b) => a.name.localeCompare(b.name));
+  if (files.length === 0) {
+    await sendMessage(chatId, 'No live properties to delete, Sharik.');
     return;
+  }
+
+  // Telegram callback_data limit is 64 bytes. Filenames can be longer than that,
+  // so we keep an in-memory token map per chat and send tokens instead.
+  const tokens = ensureDeleteTokens(chatId);
+  tokens.clear();
+
+  const keyboard = files.map((f, i) => {
+    const token = String(i);
+    tokens.set(token, f.name);
+    const label = displayLabel(f.name);
+    return [{ text: label, callback_data: `del:${token}` }];
+  });
+  keyboard.push([{ text: '✕ Close', callback_data: 'del:cancel' }]);
+
+  await sendMessageWithKeyboard(chatId,
+    `Sharik, tap the property you want to remove from the site:`,
+    keyboard
+  );
+}
+
+async function handleCallbackQuery(cq) {
+  const chatId = cq.message?.chat?.id;
+  const messageId = cq.message?.message_id;
+  const data = cq.data || '';
+
+  // Always ack quickly so the button stops spinning.
+  await answerCallback(cq.id);
+
+  if (!chatId || !data.startsWith('del:')) return;
+  const payload = data.slice(4);
+
+  if (payload === 'cancel') {
+    await editMessage(chatId, messageId, 'Closed. Nothing was deleted.');
+    deleteTokens(chatId);
+    return;
+  }
+
+  // Confirm prompt step: "del:confirm:<token>"
+  if (payload.startsWith('confirm:')) {
+    const token = payload.slice('confirm:'.length);
+    const tokens = getDeleteTokens(chatId);
+    const filename = tokens?.get(token);
+    if (!filename) {
+      await editMessage(chatId, messageId, 'That selection expired, Sharik. Run /delete again.');
+      return;
+    }
+    await editMessage(chatId, messageId, `Removing *${filename}*...`);
+    try {
+      const removed = await deleteFile(chatId, filename, /*silent*/ true);
+      tokens.delete(token);
+      await editMessage(chatId, messageId,
+        removed
+          ? `Deleted *${filename}*, Sharik. Site updates in ~60s.`
+          : `Couldn't find *${filename}* — already gone?`
+      );
+    } catch (e) {
+      const msg = e?.response?.data?.message || e.message;
+      await editMessage(chatId, messageId, `Failed to delete ${filename}: ${msg}`);
+    }
+    return;
+  }
+
+  if (payload.startsWith('back')) {
+    // Re-show the menu (cheap: just re-fetch).
+    await editMessage(chatId, messageId, 'Loading list...');
+    await showDeleteMenu(chatId);
+    return;
+  }
+
+  // Initial tap: "del:<token>" → ask for confirmation.
+  const token = payload;
+  const tokens = getDeleteTokens(chatId);
+  const filename = tokens?.get(token);
+  if (!filename) {
+    await editMessage(chatId, messageId, 'That selection expired, Sharik. Run /delete again.');
+    return;
+  }
+  const keyboard = [
+    [{ text: '🗑 Yes, delete it', callback_data: `del:confirm:${token}` }],
+    [{ text: '↩ Back to list',   callback_data: `del:back` }],
+    [{ text: '✕ Cancel',         callback_data: `del:cancel` }],
+  ];
+  await editMessageWithKeyboard(chatId, messageId,
+    `Confirm: remove *${filename}* from the site?`,
+    keyboard
+  );
+}
+
+async function deleteFile(chatId, filename, silent = false) {
+  if (filename.includes('/') || filename.includes('..')) {
+    if (!silent) await sendMessage(chatId, 'Filename must be a plain filename.');
+    return false;
   }
 
   const sha = await ghGetSha(filename);
   if (!sha) {
-    await sendMessage(chatId, `Not found: ${filename}`);
-    return;
+    if (!silent) await sendMessage(chatId, `Not found: ${filename}`);
+    return false;
   }
 
   await axios.delete(ghContentsUrl(filename), {
@@ -454,10 +579,29 @@ async function handleDelete(chatId, text) {
     },
   });
 
-  await sendMessage(chatId,
-    `Deleted ${filename}.\n\n` +
-    `Site updates in ~60s.`
-  );
+  if (!silent) {
+    await sendMessage(chatId,
+      `Deleted *${filename}*, Sharik.\n\nSite updates in ~60s.`
+    );
+  }
+  return true;
+}
+
+// Pretty label for a filename in the delete-menu button.
+function displayLabel(filename) {
+  const base = filename.replace(/\.[^/.]+$/, '');
+  const parts = base.split('_');
+  const name = parts[0] ? parts[0].replace(/-/g, ' ') : filename;
+  const typePart = parts[1] || '';
+  const locMatch = typePart.match(/^([^()]+)\(([^()]+)\)$/);
+  const cat = locMatch ? locMatch[1] : typePart;
+  const loc = locMatch ? locMatch[2].replace(/-/g, ' ') : '';
+  let label = name;
+  if (cat) label += ` · ${cat}`;
+  if (loc) label += ` (${loc})`;
+  // Telegram button text is limited; Telegram tolerates long labels but
+  // they get truncated visually. Keep them tidy.
+  return label.length > 60 ? label.slice(0, 57) + '...' : label;
 }
 
 // ---------------------------------------------------------------------------
@@ -466,18 +610,18 @@ async function handleDelete(chatId, text) {
 
 function helpText() {
   return (
-    'Cosmos project bot.\n\n' +
-    'To add projects:\n' +
-    '  1. Send a photo or a file.\n' +
-    '  2. I\'ll ask for name, section, location, badge.\n' +
-    '  3. Send more images to queue more.\n' +
-    '  4. Reply "yes" or /commit to push everything.\n\n' +
+    'Hey Sharik 👋  Cosmos showcase manager at your service.\n\n' +
+    'To list a new property:\n' +
+    '  1. Send a photo or file of the property.\n' +
+    '  2. I\'ll ask for name, section, location, and badge.\n' +
+    '  3. Send more images to queue more properties.\n' +
+    '  4. Reply "yes" or /commit when you\'re ready to publish.\n\n' +
     'Commands:\n' +
-    '  /list   — show what\'s live on the site\n' +
-    '  /queue  — show items waiting to commit\n' +
-    '  /commit — commit the queue now\n' +
-    '  /cancel — clear the queue / abort current step\n' +
-    '  /delete Filename.jpg — remove a live project\n' +
+    '  /list   — see what\'s live on your site\n' +
+    '  /queue  — see properties waiting to publish\n' +
+    '  /commit — publish the queue now\n' +
+    '  /cancel — clear queue / abort current step\n' +
+    '  /delete — pick a live property to remove (button list)\n' +
     '  /help   — this message'
   );
 }
@@ -608,6 +752,18 @@ function touch(session) {
   session.updatedAt = Date.now();
 }
 
+function ensureDeleteTokens(chatId) {
+  let m = DELETE_TOKENS.get(chatId);
+  if (!m) { m = new Map(); DELETE_TOKENS.set(chatId, m); }
+  return m;
+}
+function getDeleteTokens(chatId) {
+  return DELETE_TOKENS.get(chatId);
+}
+function deleteTokens(chatId) {
+  DELETE_TOKENS.delete(chatId);
+}
+
 // ---------------------------------------------------------------------------
 // GitHub helpers
 // ---------------------------------------------------------------------------
@@ -675,4 +831,77 @@ async function sendMessage(chatId, text) {
       throw e;
     }
   });
+}
+
+async function sendMessageWithKeyboard(chatId, text, inline_keyboard) {
+  await axios.post(
+    `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
+    {
+      chat_id: chatId,
+      text,
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard },
+    }
+  ).catch(async (e) => {
+    if (e?.response?.data?.description?.includes('parse')) {
+      await axios.post(
+        `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
+        { chat_id: chatId, text, reply_markup: { inline_keyboard } }
+      );
+    } else {
+      throw e;
+    }
+  });
+}
+
+async function editMessage(chatId, messageId, text) {
+  if (!messageId) return sendMessage(chatId, text);
+  await axios.post(
+    `https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`,
+    { chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown' }
+  ).catch(async (e) => {
+    const desc = e?.response?.data?.description || '';
+    if (desc.includes('parse')) {
+      await axios.post(
+        `https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`,
+        { chat_id: chatId, message_id: messageId, text }
+      );
+    } else if (desc.includes('not modified')) {
+      // Same content — ignore.
+    } else {
+      // Edit failed (e.g. message too old) — fall back to a fresh message.
+      await sendMessage(chatId, text);
+    }
+  });
+}
+
+async function editMessageWithKeyboard(chatId, messageId, text, inline_keyboard) {
+  if (!messageId) return sendMessageWithKeyboard(chatId, text, inline_keyboard);
+  await axios.post(
+    `https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`,
+    {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard },
+    }
+  ).catch(async (e) => {
+    const desc = e?.response?.data?.description || '';
+    if (desc.includes('parse')) {
+      await axios.post(
+        `https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`,
+        { chat_id: chatId, message_id: messageId, text, reply_markup: { inline_keyboard } }
+      );
+    } else if (!desc.includes('not modified')) {
+      await sendMessageWithKeyboard(chatId, text, inline_keyboard);
+    }
+  });
+}
+
+async function answerCallback(callbackQueryId, text = '') {
+  await axios.post(
+    `https://api.telegram.org/bot${TELEGRAM_TOKEN}/answerCallbackQuery`,
+    { callback_query_id: callbackQueryId, ...(text && { text }) }
+  ).catch(() => { /* best-effort */ });
 }

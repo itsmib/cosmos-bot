@@ -10,9 +10,9 @@ No always-on server — just a single function at `/api/webhook` that Telegram P
   Filename must follow: `PropertyName_Type_OptionalDetail.ext`
   Example: `RubyGarden_Karaikal_42Plots.jpg`
 
-- **`/delete Filename.jpg`**
-  Removes the image from `src/projectadd/` in the target repo.
-  Example: `/delete RubyGarden_Karaikal.jpg`
+- **`/delete`**
+  Sends an inline-button list of every live property — tap one, confirm, done.
+  `/delete Filename.jpg` still works as a direct shortcut.
 
 ## Deploy
 
