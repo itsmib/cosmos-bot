@@ -1,17 +1,21 @@
 // Vercel serverless function — Telegram bot webhook (conversational flow).
 //
 // Flow:
-//   1. User sends a photo or document (any filename / no filename).
-//   2. Bot asks: Name → Category → Location (optional) → Badge (optional).
-//   3. Bot queues the item, asks "add more or commit?".
-//   4. Repeat, or user sends /commit to push all queued items.
-//   5. Bot builds the canonical filename from answers and commits each to
-//      src/projectadd/ on GitHub.
+//   1. User sends a photo or document.
+//   2. Bot asks: Name → Category [buttons] → Location → Badge → yearStarted →
+//      plots → areaSqft → price → mapLink → amenities → tagline → description
+//   3. Bot asks: any additional gallery photos? [Yes/No buttons]
+//   4. If yes — collects gallery images one by one until "Done" button.
+//   5. On commit: creates folder structure in src/projectadd/<slug>/
+//        cover.<ext>
+//        gallery-1.<ext>, gallery-2.<ext>, ...
+//        <slug>.md
+//   6. Single GitHub commit with all files → one Vercel deploy.
 //
 // Other commands:
-//   /list, /delete Filename.jpg, /cancel, /help
+//   /list, /delete, /cancel, /queue, /commit, /help
 //
-// Env vars (Vercel dashboard):
+// Env vars:
 //   TELEGRAM_BOT_TOKEN, GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO, GITHUB_BRANCH
 
 const axios = require('axios');
@@ -24,41 +28,23 @@ const GITHUB_BRANCH  = process.env.GITHUB_BRANCH || 'main';
 
 const GH_CONTENTS_PATH = 'src/projectadd';
 
-const VALID_TYPES = ['Ongoing', 'Karaikal', 'Chennai', 'Renovation', 'Other'];
+const VALID_TYPES   = ['Ongoing', 'Karaikal', 'Chennai', 'Renovation', 'Other'];
 const RENO_VARIANTS = ['Before', 'After'];
-const VALID_EXTS  = ['jpg', 'jpeg', 'png', 'webp'];
-const MAX_BYTES   = 5 * 1024 * 1024;
-const YES_TOKENS  = ['yes', 'y', 'ok', 'confirm', 'commit'];
-const NO_TOKENS   = ['no', 'n', 'cancel', 'skip'];
+const VALID_EXTS    = ['jpg', 'jpeg', 'png', 'webp'];
+const MAX_BYTES     = 5 * 1024 * 1024;
+const SKIP_TOKENS   = ['skip', 's', '-', ''];
 
 // ---------------------------------------------------------------------------
 // In-memory state
 // ---------------------------------------------------------------------------
-//
-// SESSIONS[chatId] = {
-//   step: 'idle' | 'name' | 'category' | 'variant' | 'location' | 'detail' | 'more',
-//   current: { fileId, ext, name?, category?, variant?, location?, detail? } | null,
-//   queue: Array<{ fileId, ext, name, category, variant?, location?, detail? }>,
-//   updatedAt: number,
-// }
-//
-// Survives warm Vercel invocations; wiped on cold start. If that happens
-// mid-conversation, the user just starts over — /cancel clears state too.
-// For cross-container persistence swap this for Upstash Redis.
-const SESSIONS = new Map();
-const SESSION_TTL_MS = 30 * 60 * 1000; // 30 min idle → session stale
-
-// Per-chat token → filename map for /delete inline buttons.
-// Filenames can exceed Telegram's 64-byte callback_data limit, so we send a
-// short token and look up the real filename here when the button is tapped.
+const SESSIONS     = new Map();
+const SESSION_TTL  = 30 * 60 * 1000;
 const DELETE_TOKENS = new Map();
-
-// Dedup Telegram retries.
 const SEEN_UPDATES = new Set();
-const SEEN_MAX = 200;
+const SEEN_MAX     = 200;
 
 // ---------------------------------------------------------------------------
-// Handler
+// Entry point
 // ---------------------------------------------------------------------------
 
 module.exports = async (req, res) => {
@@ -89,34 +75,20 @@ module.exports = async (req, res) => {
     const chatId = message.chat.id;
     const text   = (message.text || '').trim();
 
-    // ---- Global commands (work in any state) ----
     if (text.startsWith('/start') || text.startsWith('/help')) {
       await sendMessage(chatId, helpText());
       return res.status(200).send('ok');
     }
     if (text.startsWith('/cancel')) {
       SESSIONS.delete(chatId);
-      await sendMessage(chatId, 'All clear, Sharik. Send an image whenever you\'re ready to list a property.');
+      await sendMessage(chatId, 'All clear, Sharik. Send an image whenever you\'re ready.');
       return res.status(200).send('ok');
     }
-    if (text.startsWith('/list')) {
-      await handleList(chatId);
-      return res.status(200).send('ok');
-    }
-    if (text.startsWith('/delete')) {
-      await handleDelete(chatId, text);
-      return res.status(200).send('ok');
-    }
-    if (text.startsWith('/commit')) {
-      await handleCommit(chatId);
-      return res.status(200).send('ok');
-    }
-    if (text.startsWith('/queue')) {
-      await handleQueue(chatId);
-      return res.status(200).send('ok');
-    }
+    if (text.startsWith('/list'))   { await handleList(chatId);         return res.status(200).send('ok'); }
+    if (text.startsWith('/delete')) { await handleDelete(chatId, text); return res.status(200).send('ok'); }
+    if (text.startsWith('/commit')) { await handleCommit(chatId);       return res.status(200).send('ok'); }
+    if (text.startsWith('/queue'))  { await handleQueue(chatId);        return res.status(200).send('ok'); }
 
-    // ---- Conversation flow ----
     await routeMessage(chatId, message, text);
     return res.status(200).send('ok');
 
@@ -131,43 +103,61 @@ module.exports = async (req, res) => {
 // ---------------------------------------------------------------------------
 
 async function routeMessage(chatId, message, text) {
-  const session = getSession(chatId);
-
-  // New image arrives — begin a new item. Accept both document and photo.
+  const session  = getSession(chatId);
   const incoming = extractIncomingMedia(message);
-  if (incoming) {
-    // If user was mid-flow, abandon the previous partial item; newest wins.
-    if (session.current && session.step !== 'idle' && session.step !== 'more') {
-      await sendMessage(chatId, 'Switching to the new image. Previous partial entry discarded.');
-    }
-    if (incoming.warn) {
-      await sendMessage(chatId, incoming.warn);
-    }
+
+  // New cover image — start fresh flow
+  if (incoming && session.step === 'idle') {
+    if (incoming.warn) await sendMessage(chatId, incoming.warn);
     session.current = {
-      fileId: incoming.fileId,
-      ext: incoming.ext,
-      fileSize: incoming.fileSize,
+      coverFileId:  incoming.fileId,
+      coverExt:     incoming.ext,
+      galleryFiles: [],
     };
     session.step = 'name';
     touch(session);
     await sendMessage(chatId,
-      `Got the image, Sharik. Let's list this property.\n\n` +
-      `1/4  What's the **property name**?  (e.g. Ruby Garden)\n\n` +
-      `Send /cancel anytime to drop this one.`
+      `Got the cover image, Sharik. Let\'s set up this property.\n\n` +
+      `*1 / 12*  What\'s the *property name*?  (e.g. Ruby Garden)\n\n` +
+      `Send /cancel anytime to start over.`
     );
     return;
   }
 
-  // No image, no command — interpret as an answer to whatever we're asking.
+  // Gallery image received while in gallery step
+  if (incoming && session.step === 'gallery') {
+    if (incoming.warn) await sendMessage(chatId, incoming.warn);
+    session.current.galleryFiles.push({ fileId: incoming.fileId, ext: incoming.ext });
+    touch(session);
+    const count = session.current.galleryFiles.length;
+    await sendMessageWithKeyboard(chatId,
+      `Got gallery photo ${count}. Send another or tap Done.`,
+      [[{ text: '✅ Done — no more photos', callback_data: 'gallery:done' }]]
+    );
+    return;
+  }
+
+  // Image received mid-flow (not gallery step)
+  if (incoming && session.step !== 'idle' && session.step !== 'gallery') {
+    await sendMessage(chatId, 'Please finish the current property first, or /cancel to start over.');
+    return;
+  }
+
+  // Text answers
   switch (session.step) {
-    case 'name':     return onName(chatId, session, text);
-    case 'category': return onCategory(chatId, session, text);
-    case 'variant':  return onVariant(chatId, session, text);
-    case 'location': return onLocation(chatId, session, text);
-    case 'detail':   return onDetail(chatId, session, text);
-    case 'more':     return onMore(chatId, session, text);
+    case 'name':        return onName(chatId, session, text);
+    case 'location':    return onLocation(chatId, session, text);
+    case 'badge':       return onBadge(chatId, session, text);
+    case 'yearStarted': return onYearStarted(chatId, session, text);
+    case 'plots':       return onPlots(chatId, session, text);
+    case 'areaSqft':    return onAreaSqft(chatId, session, text);
+    case 'price':       return onPrice(chatId, session, text);
+    case 'mapLink':     return onMapLink(chatId, session, text);
+    case 'amenities':   return onAmenities(chatId, session, text);
+    case 'tagline':     return onTagline(chatId, session, text);
+    case 'description': return onDescription(chatId, session, text);
+    case 'more':        return onMore(chatId, session, text);
     default:
-      // Idle — guide the user.
       await sendMessage(chatId, helpText());
   }
 }
@@ -177,154 +167,262 @@ async function routeMessage(chatId, message, text) {
 // ---------------------------------------------------------------------------
 
 async function onName(chatId, session, text) {
-  if (!text) {
-    await sendMessage(chatId, 'Please send the property name as text.');
-    return;
-  }
-  // Only enforce that the name reduces to something alphanumeric-ish.
+  if (!text) { await sendMessage(chatId, 'Please send the property name as text.'); return; }
   const cleaned = text.replace(/\s+/g, ' ').trim();
-  if (!/[A-Za-z0-9]/.test(cleaned)) {
-    await sendMessage(chatId, 'Name must contain letters or numbers. Try again.');
-    return;
-  }
-  if (cleaned.length > 60) {
-    await sendMessage(chatId, 'Name is too long (max 60 characters). Try again.');
-    return;
-  }
+  if (!/[A-Za-z0-9]/.test(cleaned)) { await sendMessage(chatId, 'Name must contain letters or numbers. Try again.'); return; }
+  if (cleaned.length > 60) { await sendMessage(chatId, 'Name too long (max 60 chars). Try again.'); return; }
   session.current.name = cleaned;
   session.step = 'category';
   touch(session);
-  await sendMessage(chatId,
-    `Nice — *${cleaned}*.\n\n` +
-    `2/4  Which **section** does it go under?  Reply with one:\n` +
-    `  • Ongoing — currently under development\n` +
-    `  • Karaikal — completed Karaikal projects\n` +
-    `  • Chennai — completed Chennai projects\n` +
-    `  • Renovation — before/after transformations\n` +
-    `  • Other — anything else`
-  );
-}
-
-async function onCategory(chatId, session, text) {
-  const match = VALID_TYPES.find(t => t.toLowerCase() === text.toLowerCase());
-  if (!match) {
-    await sendMessage(chatId,
-      `Not a valid section. Reply with exactly one of:\n` +
-      `Ongoing, Karaikal, Chennai, Renovation, Other`
-    );
-    return;
-  }
-  session.current.category = match;
-  if (match === 'Renovation') {
-    session.step = 'variant';
-    touch(session);
-    await sendMessage(chatId,
-      `Renovation pic — is this the **Before** or the **After**?\n\n` +
-      `Reply with one:\n  • Before\n  • After\n\n` +
-      `Tip: upload the matching half later with the same property name and Cosmos will pair them on the card.`
-    );
-    return;
-  }
-  session.step = 'location';
-  touch(session);
-  await sendMessage(chatId,
-    `3/4  **Location** to show on the card?  (optional)\n\n` +
-    `Helpful for Ongoing listings so buyers spot the city at a glance.\n` +
-    `Reply with the city, or send "skip" to keep it as just *${match}*.`
-  );
-}
-
-async function onVariant(chatId, session, text) {
-  const match = RENO_VARIANTS.find(v => v.toLowerCase() === text.toLowerCase());
-  if (!match) {
-    await sendMessage(chatId, 'Reply with exactly *Before* or *After*.');
-    return;
-  }
-  session.current.variant = match;
-  session.step = 'location';
-  touch(session);
-  await sendMessage(chatId,
-    `Got it — *${match}*.\n\n` +
-    `**Location** to show on the card?  (optional)\n` +
-    `Reply with the city/area, or send "skip" to keep it as *Renovation*.`
+  await sendMessageWithKeyboard(chatId,
+    `*${cleaned}* — nice.\n\n*2 / 12*  Which *section* does it belong to?`,
+    [
+      [{ text: '🔨 Ongoing',    callback_data: 'cat:Ongoing'    },
+       { text: '📍 Karaikal',   callback_data: 'cat:Karaikal'   }],
+      [{ text: '🏙 Chennai',    callback_data: 'cat:Chennai'    },
+       { text: '🔁 Renovation', callback_data: 'cat:Renovation' }],
+      [{ text: '📦 Other',      callback_data: 'cat:Other'      }],
+    ]
   );
 }
 
 async function onLocation(chatId, session, text) {
-  const skip = NO_TOKENS.includes(text.toLowerCase()) || text === '-' || text === '';
-  if (!skip) {
+  if (!isSkip(text)) {
     const cleaned = text.replace(/\s+/g, ' ').trim();
-    if (!/^[A-Za-z0-9 ]+$/.test(cleaned)) {
-      await sendMessage(chatId, 'Location can only contain letters, numbers, and spaces. Try again, or send "skip".');
+    if (!/^[A-Za-z0-9 ,]+$/.test(cleaned)) {
+      await sendMessage(chatId, 'Location can only contain letters, numbers, spaces and commas. Try again or "skip".');
       return;
     }
-    if (cleaned.length > 30) {
-      await sendMessage(chatId, 'Location too long (max 30 chars). Try again, or send "skip".');
-      return;
-    }
+    if (cleaned.length > 40) { await sendMessage(chatId, 'Location too long (max 40 chars). Try again or "skip".'); return; }
     session.current.location = cleaned;
   }
-  session.step = 'detail';
+  session.step = 'badge';
   touch(session);
   await sendMessage(chatId,
-    `4/4  **Badge text**?  (optional)\n\n` +
-    `Shown as a small crimson pill on the card — great for selling points\n` +
-    `like "42 Plots", "Sold Out", or "Phase 2".\n` +
-    `Reply with the text, or send "skip" for no badge.`
+    `*4 / 12*  *Badge text*?  (optional)\n\n` +
+    `Small crimson pill on the card — e.g. "42 Plots", "Sold Out", "Phase 2".\n` +
+    `Send text or "skip".`
   );
 }
 
-async function onDetail(chatId, session, text) {
-  const skip = NO_TOKENS.includes(text.toLowerCase()) || text === '-' || text === '';
-  if (!skip) {
+async function onBadge(chatId, session, text) {
+  if (!isSkip(text)) {
     const cleaned = text.replace(/\s+/g, ' ').trim();
-    if (!/^[A-Za-z0-9 ]+$/.test(cleaned)) {
-      await sendMessage(chatId, 'Badge can only contain letters, numbers, and spaces. Try again, or send "skip".');
-      return;
-    }
-    if (cleaned.length > 30) {
-      await sendMessage(chatId, 'Badge too long (max 30 chars). Try again, or send "skip".');
-      return;
-    }
-    session.current.detail = cleaned;
+    if (cleaned.length > 30) { await sendMessage(chatId, 'Badge too long (max 30 chars). Try again or "skip".'); return; }
+    session.current.badge = cleaned;
   }
-
-  // All fields collected — move the item into the queue.
-  const item = finaliseItem(session.current);
-  session.queue.push(item);
-  session.current = null;
-  session.step = 'more';
+  session.step = 'yearStarted';
   touch(session);
+  await sendMessage(chatId, `*5 / 12*  *Year started*?  (optional)\n\nE.g. 2022. Send the year or "skip".`);
+}
 
+async function onYearStarted(chatId, session, text) {
+  if (!isSkip(text)) {
+    if (!/^\d{4}$/.test(text.trim())) { await sendMessage(chatId, 'Please send a 4-digit year like 2022, or "skip".'); return; }
+    session.current.yearStarted = text.trim();
+  }
+  session.step = 'plots';
+  touch(session);
+  await sendMessage(chatId, `*6 / 12*  *Number of plots*?  (optional)\n\nE.g. 42. Send the number or "skip".`);
+}
+
+async function onPlots(chatId, session, text) {
+  if (!isSkip(text)) session.current.plots = text.replace(/\s+/g, ' ').trim();
+  session.step = 'areaSqft';
+  touch(session);
+  await sendMessage(chatId, `*7 / 12*  *Plot area (sqft)*?  (optional)\n\nE.g. "1200 – 2400". Send or "skip".`);
+}
+
+async function onAreaSqft(chatId, session, text) {
+  if (!isSkip(text)) session.current.areaSqft = text.replace(/\s+/g, ' ').trim();
+  session.step = 'price';
+  touch(session);
+  await sendMessage(chatId, `*8 / 12*  *Starting price*?  (optional)\n\nE.g. "From ₹48 L". Send or "skip".`);
+}
+
+async function onPrice(chatId, session, text) {
+  if (!isSkip(text)) session.current.price = text.replace(/\s+/g, ' ').trim();
+  session.step = 'mapLink';
+  touch(session);
+  await sendMessage(chatId, `*9 / 12*  *Google Maps link*?  (optional)\n\nPaste the link or "skip".`);
+}
+
+async function onMapLink(chatId, session, text) {
+  if (!isSkip(text)) {
+    if (!text.startsWith('http')) { await sendMessage(chatId, 'Please send a valid URL starting with http, or "skip".'); return; }
+    session.current.mapLink = text.trim();
+  }
+  session.step = 'amenities';
+  touch(session);
   await sendMessage(chatId,
-    `✓ Queued property #${session.queue.length}:\n` +
-    formatItem(item) + '\n\n' +
-    `Send another image to add more, or reply:\n` +
-    `  yes  → publish everything to the site\n` +
-    `  no   → drop all queued items`
+    `*10 / 12*  *Amenities*?  (optional)\n\n` +
+    `Send as comma-separated list:\n` +
+    `_Gated community, 30ft roads, Solar lighting_\n\nOr "skip".`
+  );
+}
+
+async function onAmenities(chatId, session, text) {
+  if (!isSkip(text)) {
+    session.current.amenities = text.split(',').map(s => s.trim()).filter(Boolean);
+  }
+  session.step = 'tagline';
+  touch(session);
+  await sendMessage(chatId,
+    `*11 / 12*  *Property tagline*?  (optional)\n\n` +
+    `One punchy heading line — e.g. _"A garden address, a forever home"_\n\nSend or "skip".`
+  );
+}
+
+async function onTagline(chatId, session, text) {
+  if (!isSkip(text)) session.current.tagline = text.replace(/\s+/g, ' ').trim();
+  session.step = 'description';
+  touch(session);
+  await sendMessage(chatId,
+    `*12 / 12*  *Property description*?  (optional)\n\n` +
+    `A few sentences about the property — location, highlights, why it\'s great.\n` +
+    `Plain text is fine.\n\nSend or "skip".`
+  );
+}
+
+async function onDescription(chatId, session, text) {
+  if (!isSkip(text)) session.current.description = text.trim();
+  session.step = 'gallery';
+  touch(session);
+  await sendMessageWithKeyboard(chatId,
+    `All details collected ✓\n\n` +
+    `Does this property have *additional gallery photos*?\n` +
+    `(Cover is already saved — these appear inside the detail page.)`,
+    [
+      [{ text: '📸 Yes, I have more photos', callback_data: 'gallery:yes'  }],
+      [{ text: '✅ No, that\'s it',           callback_data: 'gallery:done' }],
+    ]
   );
 }
 
 async function onMore(chatId, session, text) {
-  const lc = text.toLowerCase();
-  if (YES_TOKENS.includes(lc)) {
-    await handleCommit(chatId);
-    return;
-  }
-  if (NO_TOKENS.includes(lc)) {
-    SESSIONS.delete(chatId);
-    await sendMessage(chatId, 'No worries Sharik — queue cleared. Send an image whenever you\'re ready.');
-    return;
-  }
-  await sendMessage(chatId,
-    `Didn't catch that, Sharik. Send another image to queue more,\n` +
-    `or reply "yes" to publish, "no" to discard.\n\n` +
-    `/queue to review what's lined up.`
+  await sendMessageWithKeyboard(chatId,
+    'Send another image to queue a new property, or choose:',
+    [
+      [{ text: '🚀 Publish everything now', callback_data: 'more:commit'  }],
+      [{ text: '🗑 Discard all',             callback_data: 'more:discard' }],
+    ]
   );
 }
 
 // ---------------------------------------------------------------------------
-// Commit queued items
+// Callback query handler
+// ---------------------------------------------------------------------------
+
+async function handleCallbackQuery(cq) {
+  const chatId    = cq.message?.chat?.id;
+  const messageId = cq.message?.message_id;
+  const data      = cq.data || '';
+
+  await answerCallback(cq.id);
+  if (!chatId) return;
+
+  // Category selection
+  if (data.startsWith('cat:')) {
+    const cat     = data.slice(4);
+    const session = getSession(chatId);
+    if (session.step !== 'category') return;
+    session.current.category = cat;
+
+    if (cat === 'Renovation') {
+      session.step = 'variant';
+      touch(session);
+      await editMessage(chatId, messageId, `Section: *Renovation* ✓`);
+      await sendMessageWithKeyboard(chatId,
+        `*3a / 12*  Is this the *Before* or *After* photo?`,
+        [
+          [{ text: '⬅️ Before', callback_data: 'variant:Before' }],
+          [{ text: '➡️ After',  callback_data: 'variant:After'  }],
+        ]
+      );
+      return;
+    }
+
+    session.step = 'location';
+    touch(session);
+    await editMessage(chatId, messageId, `Section: *${cat}* ✓`);
+    await sendMessage(chatId,
+      `*3 / 12*  *Location* to show on the card?  (optional)\n\n` +
+      `E.g. "Karaikal" or "ECR Chennai". Send or "skip".`
+    );
+    return;
+  }
+
+  // Renovation variant
+  if (data.startsWith('variant:')) {
+    const variant = data.slice(8);
+    const session = getSession(chatId);
+    if (session.step !== 'variant') return;
+    session.current.variant = variant;
+    session.step = 'location';
+    touch(session);
+    await editMessage(chatId, messageId, `Variant: *${variant}* ✓`);
+    await sendMessage(chatId,
+      `*3 / 12*  *Location* to show on the card?  (optional)\n\nSend or "skip".`
+    );
+    return;
+  }
+
+  // Gallery flow
+  if (data.startsWith('gallery:')) {
+    const action  = data.slice(8);
+    const session = getSession(chatId);
+    if (session.step !== 'gallery') return;
+
+    if (action === 'yes') {
+      await editMessage(chatId, messageId, '📸 Send your gallery photos one by one. Tap Done when finished.');
+      return;
+    }
+
+    if (action === 'done') {
+      const item = finaliseItem(session.current);
+      session.queue.push(item);
+      session.current = null;
+      session.step    = 'more';
+      touch(session);
+      await editMessage(chatId, messageId, `✓ Queued: *${item.name}*`);
+      await sendMessageWithKeyboard(chatId,
+        `*${item.name}* is queued.\n\n` +
+        `📁 Ready to commit:\n` +
+        `  • cover.${item.coverExt}\n` +
+        (item.galleryFiles.length > 0 ? `  • ${item.galleryFiles.length} gallery photo(s)\n` : '') +
+        `  • ${item.slug}.md\n\n` +
+        `Send another image to queue more, or:`,
+        [
+          [{ text: '🚀 Publish everything now', callback_data: 'more:commit'  }],
+          [{ text: '🗑 Discard all',             callback_data: 'more:discard' }],
+        ]
+      );
+      return;
+    }
+    return;
+  }
+
+  // More / publish
+  if (data.startsWith('more:')) {
+    const action = data.slice(5);
+    if (action === 'commit')  { await handleCommit(chatId); return; }
+    if (action === 'discard') {
+      SESSIONS.delete(chatId);
+      await editMessage(chatId, messageId, 'Queue cleared. Send an image whenever you\'re ready.');
+      return;
+    }
+    return;
+  }
+
+  // Delete flow
+  if (data.startsWith('del:')) {
+    await handleDeleteCallback(chatId, messageId, data.slice(4));
+    return;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Commit
 // ---------------------------------------------------------------------------
 
 async function handleCommit(chatId) {
@@ -334,63 +432,146 @@ async function handleCommit(chatId) {
     return;
   }
 
-  await sendMessage(chatId, `Publishing ${session.queue.length} propert${session.queue.length === 1 ? 'y' : 'ies'} to the site, Sharik...`);
+  await sendMessage(chatId,
+    `Publishing ${session.queue.length} propert${session.queue.length === 1 ? 'y' : 'ies'} to the site...`
+  );
 
   const results = [];
   for (const item of session.queue) {
     try {
-      const outcome = await commitItem(item);
-      results.push(`✓ ${outcome.action} ${outcome.filename}`);
+      await commitProject(item);
+      results.push(`✓ ${item.name} → ${item.slug}/`);
     } catch (e) {
       const msg = e?.response?.data?.message || e.message;
-      results.push(`✗ ${item.filename}: ${msg}`);
+      results.push(`✗ ${item.name}: ${msg}`);
     }
   }
 
   SESSIONS.delete(chatId);
   await sendMessage(chatId,
     results.join('\n') + '\n\n' +
-    `Done, Sharik. Vercel is deploying — your site will reflect this in ~60s.`
+    `Done, Sharik 🎉 Vercel is deploying — site updates in ~60s.`
   );
 }
 
-async function commitItem(item) {
-  // 1. Download from Telegram.
+async function commitProject(item) {
+  const files = [];
+
+  // Cover image
+  const coverContent = await downloadFileAsBase64(item.coverFileId);
+  files.push({
+    path:    `${GH_CONTENTS_PATH}/${item.slug}/cover.${item.coverExt}`,
+    content: coverContent,
+    message: `Add cover: ${item.slug}/cover.${item.coverExt}`,
+  });
+
+  // Gallery images
+  for (let i = 0; i < item.galleryFiles.length; i++) {
+    const g       = item.galleryFiles[i];
+    const content = await downloadFileAsBase64(g.fileId);
+    files.push({
+      path:    `${GH_CONTENTS_PATH}/${item.slug}/gallery-${i + 1}.${g.ext}`,
+      content,
+      message: `Add gallery: ${item.slug}/gallery-${i + 1}.${g.ext}`,
+    });
+  }
+
+  // Markdown file
+  const mdContent = Buffer.from(buildMarkdown(item)).toString('base64');
+  files.push({
+    path:    `${GH_CONTENTS_PATH}/${item.slug}/${item.slug}.md`,
+    content: mdContent,
+    message: `Add metadata: ${item.slug}/${item.slug}.md`,
+  });
+
+  // Commit each file to GitHub
+  for (const file of files) {
+    const sha = await ghGetSha(file.path, true);
+    await axios.put(
+      ghContentsUrlFull(file.path),
+      {
+        message: file.message,
+        content: file.content,
+        branch:  GITHUB_BRANCH,
+        ...(sha && { sha }),
+      },
+      { headers: ghHeaders() }
+    );
+  }
+}
+
+async function downloadFileAsBase64(fileId) {
   const fileInfo = await axios.get(
-    `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getFile?file_id=${item.fileId}`
+    `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getFile?file_id=${fileId}`
   );
   const filePath = fileInfo.data.result.file_path;
-
-  const fileRes = await axios.get(
+  const fileRes  = await axios.get(
     `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${filePath}`,
     { responseType: 'arraybuffer' }
   );
-  const size = fileRes.data.byteLength;
-  if (size > MAX_BYTES) {
-    throw new Error(`File too large: ${(size / 1024 / 1024).toFixed(1)} MB (max 5 MB).`);
+  if (fileRes.data.byteLength > MAX_BYTES) {
+    throw new Error(`File too large: ${(fileRes.data.byteLength / 1024 / 1024).toFixed(1)} MB (max 5 MB).`);
   }
-  const contentBase64 = Buffer.from(fileRes.data).toString('base64');
-
-  // 2. Existing? Fetch sha to overwrite.
-  const sha = await ghGetSha(item.filename);
-
-  // 3. PUT to GitHub.
-  await axios.put(
-    ghContentsUrl(item.filename),
-    {
-      message: `${sha ? 'Update' : 'Add'} project image: ${item.filename}`,
-      content: contentBase64,
-      branch: GITHUB_BRANCH,
-      ...(sha && { sha }),
-    },
-    { headers: ghHeaders() }
-  );
-
-  return { action: sha ? 'updated' : 'added', filename: item.filename };
+  return Buffer.from(fileRes.data).toString('base64');
 }
 
 // ---------------------------------------------------------------------------
-// /queue — show what's pending
+// Markdown builder
+// ---------------------------------------------------------------------------
+
+function buildMarkdown(item) {
+  const fm = ['---'];
+  fm.push(`name: ${item.name}`);
+  fm.push(`category: ${item.category}`);
+  if (item.location)    fm.push(`location: ${item.location}`);
+  if (item.badge)       fm.push(`badge: ${item.badge}`);
+  if (item.yearStarted) fm.push(`yearStarted: ${item.yearStarted}`);
+  if (item.plots)       fm.push(`plots: ${item.plots}`);
+  if (item.areaSqft)    fm.push(`areaSqft: ${item.areaSqft}`);
+  if (item.price)       fm.push(`price: ${item.price}`);
+  if (item.mapLink)     fm.push(`mapLink: ${item.mapLink}`);
+  if (item.variant)     fm.push(`variant: ${item.variant}`);
+  if (item.amenities && item.amenities.length > 0) {
+    fm.push(`amenities:`);
+    for (const a of item.amenities) fm.push(`  - ${a}`);
+  }
+  fm.push('---');
+
+  const lines = [fm.join('\n')];
+  if (item.tagline)     lines.push(`\n# ${item.tagline}`);
+  if (item.description) lines.push(`\n${item.description}`);
+
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Finalise item
+// ---------------------------------------------------------------------------
+
+function finaliseItem(current) {
+  return {
+    slug:         slug(current.name),
+    name:         current.name,
+    category:     current.category,
+    variant:      current.variant     || null,
+    location:     current.location    || null,
+    badge:        current.badge       || null,
+    yearStarted:  current.yearStarted || null,
+    plots:        current.plots       || null,
+    areaSqft:     current.areaSqft    || null,
+    price:        current.price       || null,
+    mapLink:      current.mapLink     || null,
+    amenities:    current.amenities   || [],
+    tagline:      current.tagline     || null,
+    description:  current.description || null,
+    coverFileId:  current.coverFileId,
+    coverExt:     current.coverExt,
+    galleryFiles: current.galleryFiles || [],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// /queue
 // ---------------------------------------------------------------------------
 
 async function handleQueue(chatId) {
@@ -399,13 +580,17 @@ async function handleQueue(chatId) {
     await sendMessage(chatId, 'Queue is empty, Sharik. Send a property image to start.');
     return;
   }
-  const lines = [`Lined up for publishing (${session.queue.length}):`];
+  const lines = [`Queued for publishing (${session.queue.length}):`];
   session.queue.forEach((item, i) => {
-    lines.push('', `${i + 1}. ${item.filename}`);
-    lines.push(`   ${item.name} · ${item.category}${item.location ? ' · ' + item.location : ''}${item.detail ? ' · ' + item.detail : ''}`);
+    lines.push('', `${i + 1}. *${item.name}* — ${item.category}`);
+    if (item.location) lines.push(`   📍 ${item.location}`);
+    if (item.badge)    lines.push(`   🏷 ${item.badge}`);
+    lines.push(`   🖼 ${1 + item.galleryFiles.length} photo(s)`);
   });
-  lines.push('', 'Reply "yes" to publish, "no" to discard, or send another image.');
-  await sendMessage(chatId, lines.join('\n'));
+  await sendMessageWithKeyboard(chatId, lines.join('\n'), [
+    [{ text: '🚀 Publish now', callback_data: 'more:commit'  }],
+    [{ text: '🗑 Discard all', callback_data: 'more:discard' }],
+  ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -421,43 +606,18 @@ async function handleList(chatId) {
     );
     entries = Array.isArray(r.data) ? r.data : [];
   } catch (e) {
-    if (e?.response?.status === 404) {
-      await sendMessage(chatId, 'No projects live yet, Sharik — the showcase is empty.');
-      return;
-    }
+    if (e?.response?.status === 404) { await sendMessage(chatId, 'No projects live yet, Sharik.'); return; }
     throw e;
   }
 
-  const files = entries.filter(e => e.type === 'file');
-  if (files.length === 0) {
-    await sendMessage(chatId, 'No projects live yet, Sharik — the showcase is empty.');
-    return;
-  }
+  const folders = entries.filter(e => e.type === 'dir');
+  if (folders.length === 0) { await sendMessage(chatId, 'No projects live yet, Sharik.'); return; }
 
-  const buckets = { Ongoing: [], Karaikal: [], Chennai: [], Renovation: [], Other: [], _: [] };
-  for (const f of files) {
-    const parsed = parseFilename(f.name);
-    const key = parsed ? parsed.categoryLabel : '_';
-    buckets[key].push(f.name);
+  const lines = [`Sharik, you\'ve got *${folders.length}* project${folders.length === 1 ? '' : 's'} live:\n`];
+  for (const f of folders.sort((a, b) => a.name.localeCompare(b.name))) {
+    lines.push(`  • ${titleCase(f.name)}`);
   }
-
-  const sections = [
-    ['Ongoing',    'Ongoing'],
-    ['Karaikal',   'Karaikal'],
-    ['Chennai',    'Chennai'],
-    ['Renovation', 'Renovation'],
-    ['Other',      'Other'],
-    ['_',          'Unparseable'],
-  ];
-
-  const lines = [`Sharik, you've got ${files.length} propert${files.length === 1 ? 'y' : 'ies'} live on the site:`];
-  for (const [key, label] of sections) {
-    const arr = buckets[key];
-    if (!arr || arr.length === 0) continue;
-    lines.push('', `${label} (${arr.length}):`);
-    for (const name of arr.sort()) lines.push(`  ${name}`);
-  }
-  lines.push('', `Use /delete to pick one to remove.`);
+  lines.push('\nUse /delete to remove a project or specific photo.');
   await sendMessage(chatId, lines.join('\n'));
 }
 
@@ -466,20 +626,24 @@ async function handleList(chatId) {
 // ---------------------------------------------------------------------------
 
 async function handleDelete(chatId, text) {
-  const m = text.match(/^\/delete(?:@\S+)?(?:\s+(.+?))?\s*$/i);
+  const m   = text.match(/^\/delete(?:@\S+)?(?:\s+(.+?))?\s*$/i);
   const arg = m && m[1] ? m[1].trim() : '';
-
-  // No argument → show inline button list of live files.
-  if (!arg) {
-    await showDeleteMenu(chatId);
-    return;
-  }
-
-  // Legacy path: /delete Filename.jpg still works.
-  await deleteFile(chatId, arg);
+  if (!arg) { await showDeleteProjectMenu(chatId); return; }
+  await askDeleteScope(chatId, arg);
 }
 
-async function showDeleteMenu(chatId) {
+async function askDeleteScope(chatId, projSlug) {
+  await sendMessageWithKeyboard(chatId,
+    `*${titleCase(projSlug)}* — what would you like to delete?`,
+    [
+      [{ text: '🗑 Entire project',   callback_data: `del:entiredirect:${projSlug}` }],
+      [{ text: '🖼 A specific photo', callback_data: `del:photosdirect:${projSlug}` }],
+      [{ text: '✕ Cancel',           callback_data: 'del:cancel'                    }],
+    ]
+  );
+}
+
+async function showDeleteProjectMenu(chatId) {
   let entries;
   try {
     const r = await axios.get(
@@ -488,262 +652,299 @@ async function showDeleteMenu(chatId) {
     );
     entries = Array.isArray(r.data) ? r.data : [];
   } catch (e) {
-    if (e?.response?.status === 404) {
-      await sendMessage(chatId, 'No live properties to delete, Sharik.');
-      return;
-    }
+    if (e?.response?.status === 404) { await sendMessage(chatId, 'No projects to delete.'); return; }
     throw e;
   }
 
-  const files = entries.filter(e => e.type === 'file').sort((a, b) => a.name.localeCompare(b.name));
-  if (files.length === 0) {
-    await sendMessage(chatId, 'No live properties to delete, Sharik.');
-    return;
-  }
+  const folders = entries.filter(e => e.type === 'dir').sort((a, b) => a.name.localeCompare(b.name));
+  if (folders.length === 0) { await sendMessage(chatId, 'No projects to delete.'); return; }
 
-  // Telegram callback_data limit is 64 bytes. Filenames can be longer than that,
-  // so we keep an in-memory token map per chat and send tokens instead.
   const tokens = ensureDeleteTokens(chatId);
   tokens.clear();
 
-  const keyboard = files.map((f, i) => {
-    const token = String(i);
-    tokens.set(token, f.name);
-    const label = displayLabel(f.name);
-    return [{ text: label, callback_data: `del:${token}` }];
+  const keyboard = folders.map((f, i) => {
+    tokens.set(String(i), f.name);
+    return [{ text: titleCase(f.name), callback_data: `del:proj:${i}` }];
   });
   keyboard.push([{ text: '✕ Close', callback_data: 'del:cancel' }]);
 
-  await sendMessageWithKeyboard(chatId,
-    `Sharik, tap the property you want to remove from the site:`,
-    keyboard
-  );
+  await sendMessageWithKeyboard(chatId, 'Which project, Sharik?', keyboard);
 }
 
-async function handleCallbackQuery(cq) {
-  const chatId = cq.message?.chat?.id;
-  const messageId = cq.message?.message_id;
-  const data = cq.data || '';
-
-  // Always ack quickly so the button stops spinning.
-  await answerCallback(cq.id);
-
-  if (!chatId || !data.startsWith('del:')) return;
-  const payload = data.slice(4);
-
+async function handleDeleteCallback(chatId, messageId, payload) {
   if (payload === 'cancel') {
-    await editMessage(chatId, messageId, 'Closed. Nothing was deleted.');
+    await editMessage(chatId, messageId, 'Closed. Nothing deleted.');
     deleteTokens(chatId);
     return;
   }
 
-  // Confirm prompt step: "del:confirm:<token>"
-  if (payload.startsWith('confirm:')) {
-    const token = payload.slice('confirm:'.length);
-    const tokens = getDeleteTokens(chatId);
-    const filename = tokens?.get(token);
-    if (!filename) {
-      await editMessage(chatId, messageId, 'That selection expired, Sharik. Run /delete again.');
-      return;
-    }
-    await editMessage(chatId, messageId, `Removing *${filename}*...`);
+  // Back to project list
+  if (payload === 'back') {
+    await editMessage(chatId, messageId, 'Loading...');
+    await showDeleteProjectMenu(chatId);
+    return;
+  }
+
+  // Select project from menu
+  if (payload.startsWith('proj:')) {
+    const token    = payload.slice(5);
+    const tokens   = getDeleteTokens(chatId);
+    const projSlug = tokens?.get(token);
+    if (!projSlug) { await editMessage(chatId, messageId, 'Selection expired. Run /delete again.'); return; }
+    await editMessageWithKeyboard(chatId, messageId,
+      `*${titleCase(projSlug)}* — what would you like to delete?`,
+      [
+        [{ text: '🗑 Entire project',   callback_data: `del:entire:${token}`  }],
+        [{ text: '🖼 A specific photo', callback_data: `del:photos:${token}`  }],
+        [{ text: '↩ Back',             callback_data: `del:back`              }],
+        [{ text: '✕ Cancel',           callback_data: `del:cancel`            }],
+      ]
+    );
+    return;
+  }
+
+  // Confirm entire project delete (from menu)
+  if (payload.startsWith('entire:')) {
+    const token    = payload.slice(7);
+    const tokens   = getDeleteTokens(chatId);
+    const projSlug = tokens?.get(token);
+    if (!projSlug) { await editMessage(chatId, messageId, 'Selection expired.'); return; }
+    await editMessageWithKeyboard(chatId, messageId,
+      `Confirm: delete the entire *${titleCase(projSlug)}* project and all its photos?`,
+      [
+        [{ text: '🗑 Yes, delete everything', callback_data: `del:entireconfirm:${token}` }],
+        [{ text: '↩ Back',                    callback_data: `del:proj:${token}`           }],
+        [{ text: '✕ Cancel',                  callback_data: `del:cancel`                  }],
+      ]
+    );
+    return;
+  }
+
+  // Confirmed — delete entire folder (from menu token)
+  if (payload.startsWith('entireconfirm:')) {
+    const token    = payload.slice(14);
+    const tokens   = getDeleteTokens(chatId);
+    const projSlug = tokens?.get(token);
+    if (!projSlug) { await editMessage(chatId, messageId, 'Selection expired.'); return; }
+    await editMessage(chatId, messageId, `Deleting *${titleCase(projSlug)}*...`);
     try {
-      const removed = await deleteFile(chatId, filename, /*silent*/ true);
-      tokens.delete(token);
-      await editMessage(chatId, messageId,
-        removed
-          ? `Deleted *${filename}*, Sharik. Site updates in ~60s.`
-          : `Couldn't find *${filename}* — already gone?`
-      );
+      await deleteFolderContents(projSlug);
+      deleteTokens(chatId);
+      await editMessage(chatId, messageId, `✓ *${titleCase(projSlug)}* deleted. Site updates in ~60s.`);
     } catch (e) {
-      const msg = e?.response?.data?.message || e.message;
-      await editMessage(chatId, messageId, `Failed to delete ${filename}: ${msg}`);
+      await editMessage(chatId, messageId, `Failed: ${e?.response?.data?.message || e.message}`);
     }
     return;
   }
 
-  if (payload.startsWith('back')) {
-    // Re-show the menu (cheap: just re-fetch).
-    await editMessage(chatId, messageId, 'Loading list...');
-    await showDeleteMenu(chatId);
+  // Direct entire delete (from /delete <slug> path)
+  if (payload.startsWith('entiredirect:')) {
+    const projSlug = payload.slice(13);
+    await editMessageWithKeyboard(chatId, messageId,
+      `Confirm: delete the entire *${titleCase(projSlug)}* project?`,
+      [
+        [{ text: '🗑 Yes, delete everything', callback_data: `del:entiredirectconfirm:${projSlug}` }],
+        [{ text: '✕ Cancel',                  callback_data: `del:cancel`                          }],
+      ]
+    );
     return;
   }
 
-  // Initial tap: "del:<token>" → ask for confirmation.
-  const token = payload;
-  const tokens = getDeleteTokens(chatId);
-  const filename = tokens?.get(token);
-  if (!filename) {
-    await editMessage(chatId, messageId, 'That selection expired, Sharik. Run /delete again.');
+  if (payload.startsWith('entiredirectconfirm:')) {
+    const projSlug = payload.slice(20);
+    await editMessage(chatId, messageId, `Deleting *${titleCase(projSlug)}*...`);
+    try {
+      await deleteFolderContents(projSlug);
+      await editMessage(chatId, messageId, `✓ *${titleCase(projSlug)}* deleted. Site updates in ~60s.`);
+    } catch (e) {
+      await editMessage(chatId, messageId, `Failed: ${e?.response?.data?.message || e.message}`);
+    }
     return;
   }
-  const keyboard = [
-    [{ text: '🗑 Yes, delete it', callback_data: `del:confirm:${token}` }],
-    [{ text: '↩ Back to list',   callback_data: `del:back` }],
-    [{ text: '✕ Cancel',         callback_data: `del:cancel` }],
-  ];
+
+  // Show photo list (from menu token)
+  if (payload.startsWith('photos:')) {
+    const token    = payload.slice(7);
+    const tokens   = getDeleteTokens(chatId);
+    const projSlug = tokens?.get(token);
+    if (!projSlug) { await editMessage(chatId, messageId, 'Selection expired.'); return; }
+    await showPhotoDeleteMenu(chatId, messageId, projSlug, `del:proj:${token}`);
+    return;
+  }
+
+  // Show photo list (direct path)
+  if (payload.startsWith('photosdirect:')) {
+    const projSlug = payload.slice(13);
+    await showPhotoDeleteMenu(chatId, messageId, projSlug, 'del:cancel');
+    return;
+  }
+
+  // Delete specific photo confirm
+  if (payload.startsWith('photo:')) {
+    const key      = payload.slice(6);
+    const tokens   = getDeleteTokens(chatId);
+    const filePath = tokens?.get(`photo:${key}`);
+    if (!filePath) { await editMessage(chatId, messageId, 'Selection expired.'); return; }
+    await editMessageWithKeyboard(chatId, messageId,
+      `Confirm: delete *${filePath.split('/').pop()}*?`,
+      [
+        [{ text: '🗑 Yes, delete it', callback_data: `del:photoconfirm:${key}` }],
+        [{ text: '✕ Cancel',          callback_data: `del:cancel`               }],
+      ]
+    );
+    return;
+  }
+
+  // Confirmed — delete specific photo
+  if (payload.startsWith('photoconfirm:')) {
+    const key      = payload.slice(13);
+    const tokens   = getDeleteTokens(chatId);
+    const filePath = tokens?.get(`photo:${key}`);
+    if (!filePath) { await editMessage(chatId, messageId, 'Selection expired.'); return; }
+    await editMessage(chatId, messageId, `Deleting *${filePath.split('/').pop()}*...`);
+    try {
+      const sha = await ghGetSha(`${GH_CONTENTS_PATH}/${filePath}`, true);
+      if (!sha) { await editMessage(chatId, messageId, 'File not found — already deleted?'); return; }
+      await axios.delete(
+        ghContentsUrlFull(`${GH_CONTENTS_PATH}/${filePath}`),
+        { headers: ghHeaders(), data: { message: `Remove: ${filePath}`, sha, branch: GITHUB_BRANCH } }
+      );
+      deleteTokens(chatId);
+      await editMessage(chatId, messageId, `✓ *${filePath.split('/').pop()}* deleted. Site updates in ~60s.`);
+    } catch (e) {
+      await editMessage(chatId, messageId, `Failed: ${e?.response?.data?.message || e.message}`);
+    }
+    return;
+  }
+}
+
+async function showPhotoDeleteMenu(chatId, messageId, projSlug, backCallback) {
+  let files;
+  try {
+    const r = await axios.get(
+      `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GH_CONTENTS_PATH}/${projSlug}`,
+      { headers: ghHeaders(), params: { ref: GITHUB_BRANCH } }
+    );
+    files = Array.isArray(r.data) ? r.data.filter(f => f.type === 'file' && !f.name.endsWith('.md')) : [];
+  } catch (e) {
+    await editMessage(chatId, messageId, 'Could not fetch photo list.'); return;
+  }
+
+  if (files.length === 0) { await editMessage(chatId, messageId, 'No photos found in this project.'); return; }
+
+  const photoTokens = ensureDeleteTokens(chatId);
+  files.forEach((f, i) => photoTokens.set(`photo:${i}`, `${projSlug}/${f.name}`));
+
+  const keyboard = files.map((f, i) => [{ text: f.name, callback_data: `del:photo:${i}` }]);
+  keyboard.push([{ text: '↩ Back',   callback_data: backCallback  }]);
+  keyboard.push([{ text: '✕ Cancel', callback_data: 'del:cancel'  }]);
+
   await editMessageWithKeyboard(chatId, messageId,
-    `Confirm: remove *${filename}* from the site?`,
-    keyboard
+    `Which photo from *${titleCase(projSlug)}*?`, keyboard
   );
 }
 
-async function deleteFile(chatId, filename, silent = false) {
-  if (filename.includes('/') || filename.includes('..')) {
-    if (!silent) await sendMessage(chatId, 'Filename must be a plain filename.');
-    return false;
-  }
-
-  const sha = await ghGetSha(filename);
-  if (!sha) {
-    if (!silent) await sendMessage(chatId, `Not found: ${filename}`);
-    return false;
-  }
-
-  await axios.delete(ghContentsUrl(filename), {
-    headers: ghHeaders(),
-    data: {
-      message: `Remove project image: ${filename}`,
-      sha,
-      branch: GITHUB_BRANCH,
-    },
-  });
-
-  if (!silent) {
-    await sendMessage(chatId,
-      `Deleted *${filename}*, Sharik.\n\nSite updates in ~60s.`
+async function deleteFolderContents(projSlug) {
+  const r = await axios.get(
+    `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GH_CONTENTS_PATH}/${projSlug}`,
+    { headers: ghHeaders(), params: { ref: GITHUB_BRANCH } }
+  );
+  const files = Array.isArray(r.data) ? r.data.filter(f => f.type === 'file') : [];
+  for (const f of files) {
+    await axios.delete(
+      ghContentsUrlFull(`${GH_CONTENTS_PATH}/${projSlug}/${f.name}`),
+      { headers: ghHeaders(), data: { message: `Remove: ${projSlug}/${f.name}`, sha: f.sha, branch: GITHUB_BRANCH } }
     );
   }
-  return true;
-}
-
-// Pretty label for a filename in the delete-menu button.
-function displayLabel(filename) {
-  const base = filename.replace(/\.[^/.]+$/, '');
-  const parts = base.split('_');
-  const name = parts[0] ? parts[0].replace(/-/g, ' ') : filename;
-  const typePart = parts[1] || '';
-  const locMatch = typePart.match(/^([^()]+)\(([^()]+)\)$/);
-  const cat = locMatch ? locMatch[1] : typePart;
-  const loc = locMatch ? locMatch[2].replace(/-/g, ' ') : '';
-  let label = name;
-  if (cat) label += ` · ${cat}`;
-  if (loc) label += ` (${loc})`;
-  // Telegram button text is limited; Telegram tolerates long labels but
-  // they get truncated visually. Keep them tidy.
-  return label.length > 60 ? label.slice(0, 57) + '...' : label;
 }
 
 // ---------------------------------------------------------------------------
-// Help
+// GitHub helpers
 // ---------------------------------------------------------------------------
 
-function helpText() {
-  return (
-    'Hey Sharik 👋  Cosmos showcase manager at your service.\n\n' +
-    'To list a new property:\n' +
-    '  1. Send a photo or file of the property.\n' +
-    '  2. I\'ll ask for name, section, location, and badge.\n' +
-    '  3. Send more images to queue more properties.\n' +
-    '  4. Reply "yes" or /commit when you\'re ready to publish.\n\n' +
-    'Commands:\n' +
-    '  /list   — see what\'s live on your site\n' +
-    '  /queue  — see properties waiting to publish\n' +
-    '  /commit — publish the queue now\n' +
-    '  /cancel — clear queue / abort current step\n' +
-    '  /delete — pick a live property to remove (button list)\n' +
-    '  /help   — this message'
-  );
+function ghContentsUrlFull(path) {
+  return `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${encodeURIComponent(path).replace(/%2F/g, '/')}`;
 }
 
-// ---------------------------------------------------------------------------
-// Filename synthesis — builds canonical Name_Category(Location)_Detail.ext
-// ---------------------------------------------------------------------------
-
-function finaliseItem(current) {
-  const slugName   = slug(current.name);
-  const slugLoc    = current.location ? slug(current.location) : null;
-  const slugDetail = current.detail   ? slug(current.detail)   : null;
-
-  const typePart = slugLoc ? `${current.category}(${slugLoc})` : current.category;
-  const parts    = [slugName, typePart];
-  if (current.variant) parts.push(current.variant); // Renovation: Before / After
-  if (slugDetail) parts.push(slugDetail);
-
-  const filename = `${parts.join('_')}.${current.ext}`;
+function ghHeaders() {
   return {
-    fileId:   current.fileId,
-    ext:      current.ext,
-    name:     current.name,
-    category: current.category,
-    location: current.location,
-    detail:   current.detail,
-    variant:  current.variant,
-    filename,
+    Authorization: `Bearer ${GITHUB_TOKEN}`,
+    Accept:        'application/vnd.github+json',
+    'User-Agent':  'cosmos-bot',
   };
 }
 
-// Turn free text into a filename-safe slug that still round-trips back to
-// human-readable text via the frontend's titleCase() (which splits on `-`,
-// `_`, and spaces).
-//
-// We use `-` as the internal word separator (NOT `_`, because `_` is the
-// outer part separator between Name / Category / Detail).
-//
-//   "Ruby Garden"  → "Ruby-Garden"   → card shows "Ruby Garden"
-//   "42 Plots"     → "42-Plots"      → badge shows "42 Plots"
-//   "Ruby_Garden"  → "Ruby-Garden"   (user's underscores normalised)
-//   "Sky's End"    → "Skys-End"      (strips punctuation, keeps hyphen)
+async function ghGetSha(path, fullPath = false) {
+  const url = fullPath
+    ? ghContentsUrlFull(path)
+    : ghContentsUrlFull(`${GH_CONTENTS_PATH}/${path}`);
+  try {
+    const r = await axios.get(url, { headers: ghHeaders(), params: { ref: GITHUB_BRANCH } });
+    return r.data.sha;
+  } catch (e) {
+    if (e?.response?.status === 404) return undefined;
+    throw e;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Session helpers
+// ---------------------------------------------------------------------------
+
+function getSession(chatId) {
+  const now = Date.now();
+  let s = SESSIONS.get(chatId);
+  if (s && now - s.updatedAt > SESSION_TTL) { s = undefined; SESSIONS.delete(chatId); }
+  if (!s) { s = { step: 'idle', current: null, queue: [], updatedAt: now }; SESSIONS.set(chatId, s); }
+  return s;
+}
+
+function touch(s) { s.updatedAt = Date.now(); }
+
+function ensureDeleteTokens(chatId) {
+  let m = DELETE_TOKENS.get(chatId);
+  if (!m) { m = new Map(); DELETE_TOKENS.set(chatId, m); }
+  return m;
+}
+function getDeleteTokens(chatId) { return DELETE_TOKENS.get(chatId); }
+function deleteTokens(chatId)    { DELETE_TOKENS.delete(chatId); }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 function slug(raw) {
   return raw
-    .replace(/[^A-Za-z0-9\s_-]+/g, '') // drop punctuation
-    .split(/[\s_-]+/)                   // split on whitespace / _ / -
+    .replace(/[^A-Za-z0-9\s_-]+/g, '')
+    .split(/[\s_-]+/)
     .filter(Boolean)
     .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-    .join('-');
+    .join('-')
+    .toLowerCase();
 }
 
-function formatItem(item) {
-  const lines = [
-    `  File : ${item.filename}`,
-    `  Name : ${item.name}`,
-    `  Section: ${item.category}`,
-  ];
-  if (item.variant)  lines.push(`  Variant: ${item.variant}`);
-  if (item.location) lines.push(`  Location: ${item.location}`);
-  if (item.detail)   lines.push(`  Badge: ${item.detail}`);
-  return lines.join('\n');
+function titleCase(s) {
+  return s.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 
-// ---------------------------------------------------------------------------
-// Extract a photo or document from an incoming Telegram message
-// ---------------------------------------------------------------------------
+function isSkip(text) {
+  return SKIP_TOKENS.includes((text || '').toLowerCase().trim());
+}
 
 function extractIncomingMedia(message) {
-  // Document: has original filename; preferred (no Telegram compression).
   if (message.document) {
-    const d = message.document;
+    const d   = message.document;
     const ext = guessExt(d.file_name, d.mime_type);
-    if (!ext) {
-      return { error: true }; // signaled below
-    }
-    return {
-      fileId: d.file_id,
-      ext,
-      fileSize: d.file_size,
-      warn: null,
-    };
+    if (!ext) return null;
+    return { fileId: d.file_id, ext, fileSize: d.file_size, warn: null };
   }
-  // Photo: array of sizes, pick the largest. Telegram compresses these.
   if (Array.isArray(message.photo) && message.photo.length > 0) {
-    const largest = message.photo.reduce((a, b) =>
-      (a.file_size || 0) >= (b.file_size || 0) ? a : b
-    );
+    const largest = message.photo.reduce((a, b) => (a.file_size || 0) >= (b.file_size || 0) ? a : b);
     return {
-      fileId: largest.file_id,
-      ext: 'jpg', // Telegram photos are always JPEG.
+      fileId:   largest.file_id,
+      ext:      'jpg',
       fileSize: largest.file_size,
-      warn: 'Note: this was sent as a compressed photo. For best quality, send as a file next time.',
+      warn:     '⚠️ Sent as compressed photo. For best quality, send as a *file* next time.',
     };
   }
   return null;
@@ -763,146 +964,67 @@ function guessExt(filename, mimeType) {
 }
 
 // ---------------------------------------------------------------------------
-// Session helpers
+// Help
 // ---------------------------------------------------------------------------
 
-function getSession(chatId) {
-  const now = Date.now();
-  let s = SESSIONS.get(chatId);
-  if (s && now - s.updatedAt > SESSION_TTL_MS) {
-    // Stale — wipe.
-    s = undefined;
-    SESSIONS.delete(chatId);
-  }
-  if (!s) {
-    s = { step: 'idle', current: null, queue: [], updatedAt: now };
-    SESSIONS.set(chatId, s);
-  }
-  return s;
-}
-
-function touch(session) {
-  session.updatedAt = Date.now();
-}
-
-function ensureDeleteTokens(chatId) {
-  let m = DELETE_TOKENS.get(chatId);
-  if (!m) { m = new Map(); DELETE_TOKENS.set(chatId, m); }
-  return m;
-}
-function getDeleteTokens(chatId) {
-  return DELETE_TOKENS.get(chatId);
-}
-function deleteTokens(chatId) {
-  DELETE_TOKENS.delete(chatId);
+function helpText() {
+  return (
+    'Hey Sharik 👋  Cosmos showcase manager.\n\n' +
+    'To add a new property:\n' +
+    '  1. Send the *cover photo* as a file.\n' +
+    '  2. I\'ll ask for all details — name, section, location, badge,\n' +
+    '     year, plots, area, price, map link, amenities, tagline, description.\n' +
+    '  3. Then I\'ll ask if you have gallery photos.\n' +
+    '  4. Tap *Publish* — site updates in ~60s.\n\n' +
+    'Commands:\n' +
+    '  /list   — see live projects\n' +
+    '  /queue  — see what\'s waiting to publish\n' +
+    '  /commit — publish the queue now\n' +
+    '  /cancel — clear everything and start over\n' +
+    '  /delete — remove a project or specific photo\n' +
+    '  /help   — this message'
+  );
 }
 
 // ---------------------------------------------------------------------------
-// GitHub helpers
-// ---------------------------------------------------------------------------
-
-function ghContentsUrl(filename) {
-  return `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GH_CONTENTS_PATH}/${encodeURIComponent(filename)}`;
-}
-
-function ghHeaders() {
-  return {
-    Authorization: `Bearer ${GITHUB_TOKEN}`,
-    Accept: 'application/vnd.github+json',
-    'User-Agent': 'cosmos-bot',
-  };
-}
-
-async function ghGetSha(filename) {
-  try {
-    const r = await axios.get(ghContentsUrl(filename), {
-      headers: ghHeaders(),
-      params: { ref: GITHUB_BRANCH },
-    });
-    return r.data.sha;
-  } catch (e) {
-    if (e?.response?.status === 404) return undefined;
-    throw e;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Filename parser — used by /list. Mirrors src/lib/projects.ts.
-// ---------------------------------------------------------------------------
-
-function parseFilename(filename) {
-  const base = filename.replace(/\.[^/.]+$/, '');
-  const parts = base.split('_');
-  if (parts.length < 2) return null;
-  const [, rawTypePart] = parts;
-  let typeToken = rawTypePart;
-  const locMatch = rawTypePart.match(/^([^()]+)\(([^()]+)\)$/);
-  if (locMatch) typeToken = locMatch[1];
-  const typeLc = typeToken.toLowerCase();
-  if (!VALID_TYPES.map(t => t.toLowerCase()).includes(typeLc)) return null;
-  const categoryLabel = typeToken.charAt(0).toUpperCase() + typeLc.slice(1);
-  return { categoryLabel };
-}
-
-// ---------------------------------------------------------------------------
-// Telegram helper — supports basic Markdown so the prompts render nicely.
+// Telegram API helpers
 // ---------------------------------------------------------------------------
 
 async function sendMessage(chatId, text) {
-  await axios.post(
-    `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
+  await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
     { chat_id: chatId, text, parse_mode: 'Markdown' }
   ).catch(async (e) => {
-    // If Markdown parsing fails (stray _ or * in user input echoed back),
-    // retry as plain text so the user still gets the message.
     if (e?.response?.data?.description?.includes('parse')) {
-      await axios.post(
-        `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
+      await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
         { chat_id: chatId, text }
       );
-    } else {
-      throw e;
-    }
+    } else throw e;
   });
 }
 
 async function sendMessageWithKeyboard(chatId, text, inline_keyboard) {
-  await axios.post(
-    `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
-    {
-      chat_id: chatId,
-      text,
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard },
-    }
+  await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
+    { chat_id: chatId, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard } }
   ).catch(async (e) => {
     if (e?.response?.data?.description?.includes('parse')) {
-      await axios.post(
-        `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
+      await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
         { chat_id: chatId, text, reply_markup: { inline_keyboard } }
       );
-    } else {
-      throw e;
-    }
+    } else throw e;
   });
 }
 
 async function editMessage(chatId, messageId, text) {
   if (!messageId) return sendMessage(chatId, text);
-  await axios.post(
-    `https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`,
+  await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`,
     { chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown' }
   ).catch(async (e) => {
     const desc = e?.response?.data?.description || '';
     if (desc.includes('parse')) {
-      await axios.post(
-        `https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`,
+      await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`,
         { chat_id: chatId, message_id: messageId, text }
       );
-    } else if (desc.includes('not modified')) {
-      // Same content — ignore.
-    } else {
-      // Edit failed (e.g. message too old) — fall back to a fresh message.
+    } else if (!desc.includes('not modified')) {
       await sendMessage(chatId, text);
     }
   });
@@ -910,20 +1032,12 @@ async function editMessage(chatId, messageId, text) {
 
 async function editMessageWithKeyboard(chatId, messageId, text, inline_keyboard) {
   if (!messageId) return sendMessageWithKeyboard(chatId, text, inline_keyboard);
-  await axios.post(
-    `https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`,
-    {
-      chat_id: chatId,
-      message_id: messageId,
-      text,
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard },
-    }
+  await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`,
+    { chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard } }
   ).catch(async (e) => {
     const desc = e?.response?.data?.description || '';
     if (desc.includes('parse')) {
-      await axios.post(
-        `https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`,
+      await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`,
         { chat_id: chatId, message_id: messageId, text, reply_markup: { inline_keyboard } }
       );
     } else if (!desc.includes('not modified')) {
@@ -933,8 +1047,7 @@ async function editMessageWithKeyboard(chatId, messageId, text, inline_keyboard)
 }
 
 async function answerCallback(callbackQueryId, text = '') {
-  await axios.post(
-    `https://api.telegram.org/bot${TELEGRAM_TOKEN}/answerCallbackQuery`,
+  await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/answerCallbackQuery`,
     { callback_query_id: callbackQueryId, ...(text && { text }) }
-  ).catch(() => { /* best-effort */ });
+  ).catch(() => {});
 }
