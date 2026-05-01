@@ -24,7 +24,8 @@ const GITHUB_BRANCH  = process.env.GITHUB_BRANCH || 'main';
 
 const GH_CONTENTS_PATH = 'src/projectadd';
 
-const VALID_TYPES = ['Ongoing', 'Karaikal', 'Chennai', 'Other'];
+const VALID_TYPES = ['Ongoing', 'Karaikal', 'Chennai', 'Renovation', 'Other'];
+const RENO_VARIANTS = ['Before', 'After'];
 const VALID_EXTS  = ['jpg', 'jpeg', 'png', 'webp'];
 const MAX_BYTES   = 5 * 1024 * 1024;
 const YES_TOKENS  = ['yes', 'y', 'ok', 'confirm', 'commit'];
@@ -35,9 +36,9 @@ const NO_TOKENS   = ['no', 'n', 'cancel', 'skip'];
 // ---------------------------------------------------------------------------
 //
 // SESSIONS[chatId] = {
-//   step: 'idle' | 'name' | 'category' | 'location' | 'detail' | 'more',
-//   current: { fileId, ext, name?, category?, location?, detail? } | null,
-//   queue: Array<{ fileId, ext, name, category, location?, detail? }>,
+//   step: 'idle' | 'name' | 'category' | 'variant' | 'location' | 'detail' | 'more',
+//   current: { fileId, ext, name?, category?, variant?, location?, detail? } | null,
+//   queue: Array<{ fileId, ext, name, category, variant?, location?, detail? }>,
 //   updatedAt: number,
 // }
 //
@@ -161,6 +162,7 @@ async function routeMessage(chatId, message, text) {
   switch (session.step) {
     case 'name':     return onName(chatId, session, text);
     case 'category': return onCategory(chatId, session, text);
+    case 'variant':  return onVariant(chatId, session, text);
     case 'location': return onLocation(chatId, session, text);
     case 'detail':   return onDetail(chatId, session, text);
     case 'more':     return onMore(chatId, session, text);
@@ -198,6 +200,7 @@ async function onName(chatId, session, text) {
     `  • Ongoing — currently under development\n` +
     `  • Karaikal — completed Karaikal projects\n` +
     `  • Chennai — completed Chennai projects\n` +
+    `  • Renovation — before/after transformations\n` +
     `  • Other — anything else`
   );
 }
@@ -207,17 +210,43 @@ async function onCategory(chatId, session, text) {
   if (!match) {
     await sendMessage(chatId,
       `Not a valid section. Reply with exactly one of:\n` +
-      `Ongoing, Karaikal, Chennai, Other`
+      `Ongoing, Karaikal, Chennai, Renovation, Other`
     );
     return;
   }
   session.current.category = match;
+  if (match === 'Renovation') {
+    session.step = 'variant';
+    touch(session);
+    await sendMessage(chatId,
+      `Renovation pic — is this the **Before** or the **After**?\n\n` +
+      `Reply with one:\n  • Before\n  • After\n\n` +
+      `Tip: upload the matching half later with the same property name and Cosmos will pair them on the card.`
+    );
+    return;
+  }
   session.step = 'location';
   touch(session);
   await sendMessage(chatId,
     `3/4  **Location** to show on the card?  (optional)\n\n` +
     `Helpful for Ongoing listings so buyers spot the city at a glance.\n` +
     `Reply with the city, or send "skip" to keep it as just *${match}*.`
+  );
+}
+
+async function onVariant(chatId, session, text) {
+  const match = RENO_VARIANTS.find(v => v.toLowerCase() === text.toLowerCase());
+  if (!match) {
+    await sendMessage(chatId, 'Reply with exactly *Before* or *After*.');
+    return;
+  }
+  session.current.variant = match;
+  session.step = 'location';
+  touch(session);
+  await sendMessage(chatId,
+    `Got it — *${match}*.\n\n` +
+    `**Location** to show on the card?  (optional)\n` +
+    `Reply with the city/area, or send "skip" to keep it as *Renovation*.`
   );
 }
 
@@ -405,7 +434,7 @@ async function handleList(chatId) {
     return;
   }
 
-  const buckets = { Ongoing: [], Karaikal: [], Chennai: [], Other: [], _: [] };
+  const buckets = { Ongoing: [], Karaikal: [], Chennai: [], Renovation: [], Other: [], _: [] };
   for (const f of files) {
     const parsed = parseFilename(f.name);
     const key = parsed ? parsed.categoryLabel : '_';
@@ -413,11 +442,12 @@ async function handleList(chatId) {
   }
 
   const sections = [
-    ['Ongoing',  'Ongoing'],
-    ['Karaikal', 'Karaikal'],
-    ['Chennai',  'Chennai'],
-    ['Other',    'Other'],
-    ['_',        'Unparseable'],
+    ['Ongoing',    'Ongoing'],
+    ['Karaikal',   'Karaikal'],
+    ['Chennai',    'Chennai'],
+    ['Renovation', 'Renovation'],
+    ['Other',      'Other'],
+    ['_',          'Unparseable'],
   ];
 
   const lines = [`Sharik, you've got ${files.length} propert${files.length === 1 ? 'y' : 'ies'} live on the site:`];
@@ -637,6 +667,7 @@ function finaliseItem(current) {
 
   const typePart = slugLoc ? `${current.category}(${slugLoc})` : current.category;
   const parts    = [slugName, typePart];
+  if (current.variant) parts.push(current.variant); // Renovation: Before / After
   if (slugDetail) parts.push(slugDetail);
 
   const filename = `${parts.join('_')}.${current.ext}`;
@@ -647,6 +678,7 @@ function finaliseItem(current) {
     category: current.category,
     location: current.location,
     detail:   current.detail,
+    variant:  current.variant,
     filename,
   };
 }
@@ -677,6 +709,7 @@ function formatItem(item) {
     `  Name : ${item.name}`,
     `  Section: ${item.category}`,
   ];
+  if (item.variant)  lines.push(`  Variant: ${item.variant}`);
   if (item.location) lines.push(`  Location: ${item.location}`);
   if (item.detail)   lines.push(`  Badge: ${item.detail}`);
   return lines.join('\n');
