@@ -1,56 +1,69 @@
 // Vercel serverless function — Telegram bot webhook (conversational flow).
 //
-// Flow:
-//   1. User sends a photo or document.
-//   2. Bot asks: Name → Category [buttons] → Location → Badge → yearStarted →
-//      plots → areaSqft → price → mapLink → amenities → tagline → description
-//   3. Bot asks: any additional gallery photos? [Yes/No buttons]
-//   4. If yes — collects gallery images one by one until "Done" button.
-//   5. On commit: creates folder structure in src/projectadd/<slug>/
-//        cover.<ext>
-//        gallery-1.<ext>, gallery-2.<ext>, ...
-//        <slug>.md
-//   6. Single GitHub commit with all files → one Vercel deploy.
+// Changes in this version:
+//   1. Single commit via GitHub Trees API — all files in one commit, one Vercel deploy.
+//   2. Renovation flow — first image triggers "was this Before or After?" then
+//      asks for the matching image, then proceeds to name/details. Both images
+//      committed as before.<ext> and after.<ext> in the same folder.
+//   3. Queue flow — if user sends a new image while in 'more' step (after first
+//      property done), bot asks "Queue current and start new?" instead of blocking.
+//   4. Vercel deploy hook called after commit instead of relying on git auto-deploy.
 //
-// Other commands:
-//   /list, /delete, /cancel, /queue, /commit, /help
+// Folder structure per project:
+//   src/projectadd/<slug>/
+//     cover.<ext>          (non-renovation)
+//     before.<ext>         (renovation)
+//     after.<ext>          (renovation)
+//     gallery-1.<ext>, gallery-2.<ext>, ...
+//     <slug>.md
 //
 // Env vars:
 //   TELEGRAM_BOT_TOKEN, GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO, GITHUB_BRANCH
 
 const axios = require('axios');
 
-const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const GITHUB_TOKEN   = process.env.GITHUB_TOKEN;
-const GITHUB_OWNER   = process.env.GITHUB_OWNER;
-const GITHUB_REPO    = process.env.GITHUB_REPO;
-const GITHUB_BRANCH  = process.env.GITHUB_BRANCH || 'main';
+const TELEGRAM_TOKEN  = process.env.TELEGRAM_BOT_TOKEN;
+const GITHUB_TOKEN    = process.env.GITHUB_TOKEN;
+const GITHUB_OWNER    = process.env.GITHUB_OWNER;
+const GITHUB_REPO     = process.env.GITHUB_REPO;
+const GITHUB_BRANCH   = process.env.GITHUB_BRANCH || 'main';
+const VERCEL_DEPLOY_HOOK = 'https://api.vercel.com/v1/integrations/deploy/prj_H7VgRGbIdsqRiU8JwIf9qM0vEqfS/elQSqTjxqP';
 
 const GH_CONTENTS_PATH = 'src/projectadd';
+const GH_API_BASE      = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}`;
 
-const VALID_TYPES   = ['Ongoing', 'Karaikal', 'Chennai', 'Renovation', 'Other'];
-const RENO_VARIANTS = ['Before', 'After'];
-const VALID_EXTS    = ['jpg', 'jpeg', 'png', 'webp'];
-const MAX_BYTES     = 5 * 1024 * 1024;
-const SKIP_TOKENS   = ['skip', 's', '-', ''];
+const VALID_EXTS   = ['jpg', 'jpeg', 'png', 'webp'];
+const MAX_BYTES    = 5 * 1024 * 1024;
+const SKIP_TOKENS  = ['skip', 's', '-', ''];
 
 // ---------------------------------------------------------------------------
 // In-memory state
 // ---------------------------------------------------------------------------
-const SESSIONS     = new Map();
-const SESSION_TTL  = 30 * 60 * 1000;
+//
+// session.step values:
+//   idle | reno_label_first | reno_wait_second | name | category | location |
+//   badge | yearStarted | plots | areaSqft | price | mapLink | amenities |
+//   tagline | description | gallery | more
+//
+// session.current for normal property:
+//   { coverFileId, coverExt, galleryFiles[], name, category, location?, ... }
+//
+// session.current for renovation:
+//   { renoFiles: [{fileId, ext, label}], waitingLabel?, galleryFiles[], name, ... }
+//   renoFiles grows to 2 entries (before + after) before proceeding to name.
+
+const SESSIONS      = new Map();
+const SESSION_TTL   = 30 * 60 * 1000;
 const DELETE_TOKENS = new Map();
-const SEEN_UPDATES = new Set();
-const SEEN_MAX     = 200;
+const SEEN_UPDATES  = new Set();
+const SEEN_MAX      = 200;
 
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 module.exports = async (req, res) => {
-  if (req.method !== 'POST') {
-    return res.status(200).send('cosmos-bot webhook alive');
-  }
+  if (req.method !== 'POST') return res.status(200).send('cosmos-bot webhook alive');
 
   try {
     const body = req.body || {};
@@ -64,10 +77,7 @@ module.exports = async (req, res) => {
       }
     }
 
-    if (body.callback_query) {
-      await handleCallbackQuery(body.callback_query);
-      return res.status(200).send('ok');
-    }
+    if (body.callback_query) { await handleCallbackQuery(body.callback_query); return res.status(200).send('ok'); }
 
     const message = body.message;
     if (!message) return res.status(200).send('ok');
@@ -75,15 +85,8 @@ module.exports = async (req, res) => {
     const chatId = message.chat.id;
     const text   = (message.text || '').trim();
 
-    if (text.startsWith('/start') || text.startsWith('/help')) {
-      await sendMessage(chatId, helpText());
-      return res.status(200).send('ok');
-    }
-    if (text.startsWith('/cancel')) {
-      SESSIONS.delete(chatId);
-      await sendMessage(chatId, 'All clear, Sharik. Send an image whenever you\'re ready.');
-      return res.status(200).send('ok');
-    }
+    if (text.startsWith('/start') || text.startsWith('/help')) { await sendMessage(chatId, helpText()); return res.status(200).send('ok'); }
+    if (text.startsWith('/cancel')) { SESSIONS.delete(chatId); await sendMessage(chatId, 'All clear, Sharik. Send an image whenever you\'re ready.'); return res.status(200).send('ok'); }
     if (text.startsWith('/list'))   { await handleList(chatId);         return res.status(200).send('ok'); }
     if (text.startsWith('/delete')) { await handleDelete(chatId, text); return res.status(200).send('ok'); }
     if (text.startsWith('/commit')) { await handleCommit(chatId);       return res.status(200).send('ok'); }
@@ -91,7 +94,6 @@ module.exports = async (req, res) => {
 
     await routeMessage(chatId, message, text);
     return res.status(200).send('ok');
-
   } catch (err) {
     console.error(err?.response?.data || err.message);
     return res.status(200).send('ok');
@@ -106,44 +108,76 @@ async function routeMessage(chatId, message, text) {
   const session  = getSession(chatId);
   const incoming = extractIncomingMedia(message);
 
-  // New cover image — start fresh flow
-  if (incoming && session.step === 'idle') {
-    if (incoming.warn) await sendMessage(chatId, incoming.warn);
-    session.current = {
-      coverFileId:  incoming.fileId,
-      coverExt:     incoming.ext,
-      galleryFiles: [],
-    };
-    session.step = 'name';
-    touch(session);
-    await sendMessage(chatId,
-      `Got the cover image, Sharik. Let\'s set up this property.\n\n` +
-      `*1 / 12*  What\'s the *property name*?  (e.g. Ruby Garden)\n\n` +
-      `Send /cancel anytime to start over.`
-    );
-    return;
-  }
+  // ── New image received ────────────────────────────────────────────────────
 
-  // Gallery image received while in gallery step
-  if (incoming && session.step === 'gallery') {
-    if (incoming.warn) await sendMessage(chatId, incoming.warn);
-    session.current.galleryFiles.push({ fileId: incoming.fileId, ext: incoming.ext });
-    touch(session);
-    const count = session.current.galleryFiles.length;
-    await sendMessageWithKeyboard(chatId,
-      `Got gallery photo ${count}. Send another or tap Done.`,
-      [[{ text: '✅ Done — no more photos', callback_data: 'gallery:done' }]]
-    );
-    return;
-  }
+  if (incoming) {
+    // Idle → start fresh flow
+    if (session.step === 'idle') {
+      if (incoming.warn) await sendMessage(chatId, incoming.warn);
+      session.current = { coverFileId: incoming.fileId, coverExt: incoming.ext, galleryFiles: [], isReno: false };
+      session.step = 'name';
+      touch(session);
+      await sendMessage(chatId,
+        `Got the image, Sharik. Let\'s set up this property.\n\n` +
+        `*1 / 12*  What\'s the *property name*?  (e.g. Ruby Garden)\n\n` +
+        `Send /cancel anytime to start over.`
+      );
+      return;
+    }
 
-  // Image received mid-flow (not gallery step)
-  if (incoming && session.step !== 'idle' && session.step !== 'gallery') {
+    // Gallery step → collect gallery photos
+    if (session.step === 'gallery') {
+      if (incoming.warn) await sendMessage(chatId, incoming.warn);
+      session.current.galleryFiles.push({ fileId: incoming.fileId, ext: incoming.ext });
+      touch(session);
+      await sendMessageWithKeyboard(chatId,
+        `Got gallery photo ${session.current.galleryFiles.length}. Send another or tap Done.`,
+        [[{ text: '✅ Done — no more photos', callback_data: 'gallery:done' }]]
+      );
+      return;
+    }
+
+    // Waiting for the second renovation image
+    if (session.step === 'reno_wait_second') {
+      if (incoming.warn) await sendMessage(chatId, incoming.warn);
+      const label = session.current.waitingLabel; // 'Before' or 'After'
+      session.current.renoFiles.push({ fileId: incoming.fileId, ext: incoming.ext, label });
+      session.current.waitingLabel = null;
+      session.step = 'name';
+      touch(session);
+      await sendMessage(chatId,
+        `Got the *${label}* photo ✓\n\n` +
+        `Now let\'s fill in the property details.\n\n` +
+        `*1 / 12*  What\'s the *property name*?  (e.g. Falcon House)`
+      );
+      return;
+    }
+
+    // More step → user sent a new image after first property done
+    // Queue current property and start fresh with the new image
+    if (session.step === 'more') {
+      if (incoming.warn) await sendMessage(chatId, incoming.warn);
+      // The queue already has the previous item (it was pushed in gallery:done)
+      // Start fresh flow for the new image
+      session.current = { coverFileId: incoming.fileId, coverExt: incoming.ext, galleryFiles: [], isReno: false };
+      session.step = 'name';
+      touch(session);
+      await sendMessageWithKeyboard(chatId,
+        `Got a new image, Sharik. The previous property is already queued ✓\n\n` +
+        `Let\'s set up this new property.\n` +
+        `*1 / 12*  What\'s the *property name*?`,
+        [[{ text: '🚀 Skip this — publish queue now', callback_data: 'more:commit' }]]
+      );
+      return;
+    }
+
+    // Any other mid-flow step → block
     await sendMessage(chatId, 'Please finish the current property first, or /cancel to start over.');
     return;
   }
 
-  // Text answers
+  // ── Text answers ──────────────────────────────────────────────────────────
+
   switch (session.step) {
     case 'name':        return onName(chatId, session, text);
     case 'location':    return onLocation(chatId, session, text);
@@ -189,11 +223,8 @@ async function onName(chatId, session, text) {
 async function onLocation(chatId, session, text) {
   if (!isSkip(text)) {
     const cleaned = text.replace(/\s+/g, ' ').trim();
-    if (!/^[A-Za-z0-9 ,]+$/.test(cleaned)) {
-      await sendMessage(chatId, 'Location can only contain letters, numbers, spaces and commas. Try again or "skip".');
-      return;
-    }
-    if (cleaned.length > 40) { await sendMessage(chatId, 'Location too long (max 40 chars). Try again or "skip".'); return; }
+    if (!/^[A-Za-z0-9 ,]+$/.test(cleaned)) { await sendMessage(chatId, 'Letters, numbers, spaces and commas only. Try again or tap Skip.'); return; }
+    if (cleaned.length > 40) { await sendMessage(chatId, 'Location too long (max 40 chars). Try again or tap Skip.'); return; }
     session.current.location = cleaned;
   }
   await goToStep(chatId, session, 'badge');
@@ -240,9 +271,7 @@ async function onMapLink(chatId, session, text) {
 }
 
 async function onAmenities(chatId, session, text) {
-  if (!isSkip(text)) {
-    session.current.amenities = text.split(',').map(s => s.trim()).filter(Boolean);
-  }
+  if (!isSkip(text)) session.current.amenities = text.split(',').map(s => s.trim()).filter(Boolean);
   await goToStep(chatId, session, 'tagline');
 }
 
@@ -256,49 +285,30 @@ async function onDescription(chatId, session, text) {
   await goToStep(chatId, session, 'gallery');
 }
 
+async function onMore(chatId, session, text) {
+  await sendMessageWithKeyboard(chatId,
+    'Send another image to queue a new property, or choose:',
+    [
+      [{ text: '🚀 Publish everything now', callback_data: 'more:commit'  }],
+      [{ text: '🗑 Discard all',             callback_data: 'more:discard' }],
+    ]
+  );
+}
+
 // ---------------------------------------------------------------------------
-// Step prompts — central place for the question text + skip-button keyboard
+// Step prompts
 // ---------------------------------------------------------------------------
 
 const STEP_PROMPTS = {
-  badge: {
-    text:
-      `*4 / 12*  *Badge text*?  (optional)\n\n` +
-      `Small crimson pill on the card — e.g. "42 Plots", "Sold Out", "Phase 2".\n` +
-      `Send text or tap Skip.`,
-  },
-  yearStarted: {
-    text: `*5 / 12*  *Year started*?  (optional)\n\nE.g. 2022. Send the year or tap Skip.`,
-  },
-  plots: {
-    text: `*6 / 12*  *Number of plots*?  (optional)\n\nE.g. 42. Send the number or tap Skip.`,
-  },
-  areaSqft: {
-    text: `*7 / 12*  *Plot area (sqft)*?  (optional)\n\nE.g. "1200 – 2400". Send or tap Skip.`,
-  },
-  price: {
-    text: `*8 / 12*  *Starting price*?  (optional)\n\nE.g. "From ₹48 L". Send or tap Skip.`,
-  },
-  mapLink: {
-    text: `*9 / 12*  *Google Maps link*?  (optional)\n\nPaste the link or tap Skip.`,
-  },
-  amenities: {
-    text:
-      `*10 / 12*  *Amenities*?  (optional)\n\n` +
-      `Send as comma-separated list:\n` +
-      `_Gated community, 30ft roads, Solar lighting_\n\nOr tap Skip.`,
-  },
-  tagline: {
-    text:
-      `*11 / 12*  *Property tagline*?  (optional)\n\n` +
-      `One punchy heading line — e.g. _"A garden address, a forever home"_\n\nSend or tap Skip.`,
-  },
-  description: {
-    text:
-      `*12 / 12*  *Property description*?  (optional)\n\n` +
-      `A few sentences about the property — location, highlights, why it\'s great.\n` +
-      `Plain text is fine.\n\nSend or tap Skip.`,
-  },
+  badge:       { text: `*4 / 12*  *Badge text*?  (optional)\n\nSmall crimson pill — e.g. "42 Plots", "Sold Out". Send or tap Skip.` },
+  yearStarted: { text: `*5 / 12*  *Year started*?  (optional)\n\nE.g. 2022. Send or tap Skip.` },
+  plots:       { text: `*6 / 12*  *Number of plots*?  (optional)\n\nE.g. 42. Send or tap Skip.` },
+  areaSqft:    { text: `*7 / 12*  *Plot area (sqft)*?  (optional)\n\nE.g. "1200 – 2400". Send or tap Skip.` },
+  price:       { text: `*8 / 12*  *Starting price*?  (optional)\n\nE.g. "From ₹48 L". Send or tap Skip.` },
+  mapLink:     { text: `*9 / 12*  *Google Maps link*?  (optional)\n\nPaste the link or tap Skip.` },
+  amenities:   { text: `*10 / 12*  *Amenities*?  (optional)\n\nComma-separated: _Gated community, 30ft roads, Solar lighting_\n\nOr tap Skip.` },
+  tagline:     { text: `*11 / 12*  *Property tagline*?  (optional)\n\nE.g. _"A garden address, a forever home"_\n\nSend or tap Skip.` },
+  description: { text: `*12 / 12*  *Property description*?  (optional)\n\nA few sentences about the property. Plain text. Send or tap Skip.` },
 };
 
 function skipKeyboard(step) {
@@ -311,9 +321,8 @@ async function goToStep(chatId, session, step) {
 
   if (step === 'gallery') {
     await sendMessageWithKeyboard(chatId,
-      `All details collected ✓\n\n` +
-      `Does this property have *additional gallery photos*?\n` +
-      `(Cover is already saved — these appear inside the detail page.)`,
+      `All details collected ✓\n\nDoes this property have *additional gallery photos*?\n` +
+      `(These appear in the detail page slideshow.)`,
       [
         [{ text: '📸 Yes, I have more photos', callback_data: 'gallery:yes'  }],
         [{ text: '✅ No, that\'s it',           callback_data: 'gallery:done' }],
@@ -325,16 +334,6 @@ async function goToStep(chatId, session, step) {
   const prompt = STEP_PROMPTS[step];
   if (!prompt) return;
   await sendMessageWithKeyboard(chatId, prompt.text, skipKeyboard(step));
-}
-
-async function onMore(chatId, session, text) {
-  await sendMessageWithKeyboard(chatId,
-    'Send another image to queue a new property, or choose:',
-    [
-      [{ text: '🚀 Publish everything now', callback_data: 'more:commit'  }],
-      [{ text: '🗑 Discard all',             callback_data: 'more:discard' }],
-    ]
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -349,7 +348,7 @@ async function handleCallbackQuery(cq) {
   await answerCallback(cq.id);
   if (!chatId) return;
 
-  // Category selection
+  // ── Category selection ────────────────────────────────────────────────────
   if (data.startsWith('cat:')) {
     const cat     = data.slice(4);
     const session = getSession(chatId);
@@ -357,14 +356,18 @@ async function handleCallbackQuery(cq) {
     session.current.category = cat;
 
     if (cat === 'Renovation') {
-      session.step = 'variant';
+      // Mark as renovation — collect Before and After images before name/details
+      session.current.isReno    = true;
+      session.current.renoFiles = [];
+      // The first image was already uploaded as coverFileId — ask which it is
+      session.step = 'reno_label_first';
       touch(session);
       await editMessage(chatId, messageId, `Section: *Renovation* ✓`);
       await sendMessageWithKeyboard(chatId,
-        `*3a / 12*  Is this the *Before* or *After* photo?`,
+        `Was the image you just sent the *Before* or *After* photo?`,
         [
-          [{ text: '⬅️ Before', callback_data: 'variant:Before' }],
-          [{ text: '➡️ After',  callback_data: 'variant:After'  }],
+          [{ text: '⬅️ Before', callback_data: 'renolabel:Before' }],
+          [{ text: '➡️ After',  callback_data: 'renolabel:After'  }],
         ]
       );
       return;
@@ -374,45 +377,51 @@ async function handleCallbackQuery(cq) {
     touch(session);
     await editMessage(chatId, messageId, `Section: *${cat}* ✓`);
     await sendMessageWithKeyboard(chatId,
-      `*3 / 12*  *Location* to show on the card?  (optional)\n\n` +
-      `E.g. "Karaikal" or "ECR Chennai". Send or tap Skip.`,
+      `*3 / 12*  *Location* to show on the card?  (optional)\n\nE.g. "Karaikal". Send or tap Skip.`,
       skipKeyboard('location')
     );
     return;
   }
 
-  // Renovation variant
-  if (data.startsWith('variant:')) {
-    const variant = data.slice(8);
+  // ── Renovation: label the first uploaded image ────────────────────────────
+  if (data.startsWith('renolabel:')) {
+    const label   = data.slice(10); // 'Before' or 'After'
     const session = getSession(chatId);
-    if (session.step !== 'variant') return;
-    session.current.variant = variant;
-    session.step = 'location';
+    if (session.step !== 'reno_label_first') return;
+
+    // Store the first image with its label
+    session.current.renoFiles.push({
+      fileId: session.current.coverFileId,
+      ext:    session.current.coverExt,
+      label,
+    });
+    // Clear coverFileId — renovation uses renoFiles instead
+    session.current.coverFileId = null;
+    session.current.coverExt    = null;
+
+    const needed = label === 'Before' ? 'After' : 'Before';
+    session.current.waitingLabel = needed;
+    session.step = 'reno_wait_second';
     touch(session);
-    await editMessage(chatId, messageId, `Variant: *${variant}* ✓`);
-    await sendMessageWithKeyboard(chatId,
-      `*3 / 12*  *Location* to show on the card?  (optional)\n\nSend or tap Skip.`,
-      skipKeyboard('location')
+
+    await editMessage(chatId, messageId, `*${label}* photo saved ✓`);
+    await sendMessage(chatId,
+      `Now send the *${needed}* photo for this renovation project.\n\n` +
+      `Send it as a file for best quality.`
     );
     return;
   }
 
-  // Skip an optional field — advance to the next step without setting anything
+  // ── Skip an optional field ────────────────────────────────────────────────
   if (data.startsWith('skip:')) {
     const step    = data.slice(5);
     const session = getSession(chatId);
     if (session.step !== step) return;
 
     const NEXT = {
-      location:    'badge',
-      badge:       'yearStarted',
-      yearStarted: 'plots',
-      plots:       'areaSqft',
-      areaSqft:    'price',
-      price:       'mapLink',
-      mapLink:     'amenities',
-      amenities:   'tagline',
-      tagline:     'description',
+      location: 'badge', badge: 'yearStarted', yearStarted: 'plots',
+      plots: 'areaSqft', areaSqft: 'price', price: 'mapLink',
+      mapLink: 'amenities', amenities: 'tagline', tagline: 'description',
       description: 'gallery',
     };
     const nextStep = NEXT[step];
@@ -423,14 +432,14 @@ async function handleCallbackQuery(cq) {
     return;
   }
 
-  // Gallery flow
+  // ── Gallery flow ──────────────────────────────────────────────────────────
   if (data.startsWith('gallery:')) {
     const action  = data.slice(8);
     const session = getSession(chatId);
     if (session.step !== 'gallery') return;
 
     if (action === 'yes') {
-      await editMessage(chatId, messageId, '📸 Send your gallery photos one by one. Tap Done when finished.');
+      await editMessage(chatId, messageId, '📸 Send gallery photos one by one. Tap Done when finished.');
       return;
     }
 
@@ -441,13 +450,18 @@ async function handleCallbackQuery(cq) {
       session.step    = 'more';
       touch(session);
       await editMessage(chatId, messageId, `✓ Queued: *${item.name}*`);
+      const photoCount = item.isReno
+        ? item.renoFiles.length + item.galleryFiles.length
+        : 1 + item.galleryFiles.length;
       await sendMessageWithKeyboard(chatId,
         `*${item.name}* is queued.\n\n` +
         `📁 Ready to commit:\n` +
-        `  • cover.${item.coverExt}\n` +
+        (item.isReno
+          ? item.renoFiles.map(r => `  • ${r.label.toLowerCase()}.${r.ext}`).join('\n') + '\n'
+          : `  • cover.${item.coverExt}\n`) +
         (item.galleryFiles.length > 0 ? `  • ${item.galleryFiles.length} gallery photo(s)\n` : '') +
         `  • ${item.slug}.md\n\n` +
-        `Send another image to queue more, or:`,
+        `Send another image to add another property, or:`,
         [
           [{ text: '🚀 Publish everything now', callback_data: 'more:commit'  }],
           [{ text: '🗑 Discard all',             callback_data: 'more:discard' }],
@@ -458,7 +472,7 @@ async function handleCallbackQuery(cq) {
     return;
   }
 
-  // More / publish
+  // ── More / publish ────────────────────────────────────────────────────────
   if (data.startsWith('more:')) {
     const action = data.slice(5);
     if (action === 'commit')  { await handleCommit(chatId); return; }
@@ -470,7 +484,7 @@ async function handleCallbackQuery(cq) {
     return;
   }
 
-  // Delete flow
+  // ── Delete flow ───────────────────────────────────────────────────────────
   if (data.startsWith('del:')) {
     await handleDeleteCallback(chatId, messageId, data.slice(4));
     return;
@@ -478,7 +492,7 @@ async function handleCallbackQuery(cq) {
 }
 
 // ---------------------------------------------------------------------------
-// Commit
+// Commit — GitHub Trees API (single commit, one Vercel deploy)
 // ---------------------------------------------------------------------------
 
 async function handleCommit(chatId) {
@@ -489,77 +503,138 @@ async function handleCommit(chatId) {
   }
 
   await sendMessage(chatId,
-    `Publishing ${session.queue.length} propert${session.queue.length === 1 ? 'y' : 'ies'} to the site...`
+    `Publishing ${session.queue.length} propert${session.queue.length === 1 ? 'y' : 'ies'} in one commit...`
   );
 
-  const results = [];
-  for (const item of session.queue) {
-    try {
-      await commitProject(item);
-      results.push(`✓ ${item.name} → ${item.slug}/`);
-    } catch (e) {
-      const msg = e?.response?.data?.message || e.message;
-      results.push(`✗ ${item.name}: ${msg}`);
+  try {
+    // 1. Download all files for all queued items
+    const allTreeEntries = [];
+
+    for (const item of session.queue) {
+      if (item.isReno) {
+        // Before and After images
+        for (const rFile of item.renoFiles) {
+          const content = await downloadFileAsBase64(rFile.fileId);
+          allTreeEntries.push({
+            path:    `${GH_CONTENTS_PATH}/${item.slug}/${rFile.label.toLowerCase()}.${rFile.ext}`,
+            mode:    '100644',
+            type:    'blob',
+            content: Buffer.from(content, 'base64').toString('binary'), // will use blob API below
+            _base64: content,
+          });
+        }
+      } else {
+        // Cover image
+        const content = await downloadFileAsBase64(item.coverFileId);
+        allTreeEntries.push({
+          path:    `${GH_CONTENTS_PATH}/${item.slug}/cover.${item.coverExt}`,
+          mode:    '100644',
+          type:    'blob',
+          _base64: content,
+        });
+      }
+
+      // Gallery images
+      for (let i = 0; i < item.galleryFiles.length; i++) {
+        const g       = item.galleryFiles[i];
+        const content = await downloadFileAsBase64(g.fileId);
+        allTreeEntries.push({
+          path:    `${GH_CONTENTS_PATH}/${item.slug}/gallery-${i + 1}.${g.ext}`,
+          mode:    '100644',
+          type:    'blob',
+          _base64: content,
+        });
+      }
+
+      // Markdown file
+      allTreeEntries.push({
+        path:    `${GH_CONTENTS_PATH}/${item.slug}/${item.slug}.md`,
+        mode:    '100644',
+        type:    'blob',
+        _base64: Buffer.from(buildMarkdown(item)).toString('base64'),
+      });
     }
-  }
 
-  SESSIONS.delete(chatId);
-  await sendMessage(chatId,
-    results.join('\n') + '\n\n' +
-    `Done, Sharik 🎉 Vercel is deploying — site updates in ~60s.`
-  );
-}
+    // 2. Create blobs for binary files (images), use content for text files
+    const treeItems = [];
+    for (const entry of allTreeEntries) {
+      if (entry.path.endsWith('.md')) {
+        // Text file — use content directly in tree
+        treeItems.push({
+          path:    entry.path,
+          mode:    entry.mode,
+          type:    entry.type,
+          content: Buffer.from(entry._base64, 'base64').toString('utf8'),
+        });
+      } else {
+        // Binary file — create blob first, use sha in tree
+        const blobRes = await axios.post(
+          `${GH_API_BASE}/git/blobs`,
+          { content: entry._base64, encoding: 'base64' },
+          { headers: ghHeaders() }
+        );
+        treeItems.push({
+          path: entry.path,
+          mode: entry.mode,
+          type: entry.type,
+          sha:  blobRes.data.sha,
+        });
+      }
+    }
 
-async function commitProject(item) {
-  const files = [];
+    // 3. Get current HEAD commit SHA and tree SHA
+    const refRes    = await axios.get(`${GH_API_BASE}/git/ref/heads/${GITHUB_BRANCH}`, { headers: ghHeaders() });
+    const headSha   = refRes.data.object.sha;
+    const commitRes = await axios.get(`${GH_API_BASE}/git/commits/${headSha}`, { headers: ghHeaders() });
+    const treeSha   = commitRes.data.tree.sha;
 
-  // Cover image
-  const coverContent = await downloadFileAsBase64(item.coverFileId);
-  files.push({
-    path:    `${GH_CONTENTS_PATH}/${item.slug}/cover.${item.coverExt}`,
-    content: coverContent,
-    message: `Add cover: ${item.slug}/cover.${item.coverExt}`,
-  });
+    // 4. Create new tree on top of existing tree
+    const newTreeRes = await axios.post(
+      `${GH_API_BASE}/git/trees`,
+      { base_tree: treeSha, tree: treeItems },
+      { headers: ghHeaders() }
+    );
+    const newTreeSha = newTreeRes.data.sha;
 
-  // Gallery images
-  for (let i = 0; i < item.galleryFiles.length; i++) {
-    const g       = item.galleryFiles[i];
-    const content = await downloadFileAsBase64(g.fileId);
-    files.push({
-      path:    `${GH_CONTENTS_PATH}/${item.slug}/gallery-${i + 1}.${g.ext}`,
-      content,
-      message: `Add gallery: ${item.slug}/gallery-${i + 1}.${g.ext}`,
-    });
-  }
-
-  // Markdown file
-  const mdContent = Buffer.from(buildMarkdown(item)).toString('base64');
-  files.push({
-    path:    `${GH_CONTENTS_PATH}/${item.slug}/${item.slug}.md`,
-    content: mdContent,
-    message: `Add metadata: ${item.slug}/${item.slug}.md`,
-  });
-
-  // Commit each file to GitHub
-  for (const file of files) {
-    const sha = await ghGetSha(file.path, true);
-    await axios.put(
-      ghContentsUrlFull(file.path),
+    // 5. Create a single commit
+    const names     = session.queue.map(i => i.name).join(', ');
+    const newCommit = await axios.post(
+      `${GH_API_BASE}/git/commits`,
       {
-        message: file.message,
-        content: file.content,
-        branch:  GITHUB_BRANCH,
-        ...(sha && { sha }),
+        message: `Add project${session.queue.length > 1 ? 's' : ''}: ${names}`,
+        tree:    newTreeSha,
+        parents: [headSha],
       },
       { headers: ghHeaders() }
     );
+    const newCommitSha = newCommit.data.sha;
+
+    // 6. Update branch ref
+    await axios.patch(
+      `${GH_API_BASE}/git/refs/heads/${GITHUB_BRANCH}`,
+      { sha: newCommitSha },
+      { headers: ghHeaders() }
+    );
+
+    // 7. Trigger Vercel deploy hook
+    await axios.get(VERCEL_DEPLOY_HOOK).catch(e => console.error('Deploy hook failed:', e.message));
+
+    const summary = session.queue.map(i => `✓ ${i.name} → ${i.slug}/`).join('\n');
+    SESSIONS.delete(chatId);
+    await sendMessage(chatId,
+      summary + '\n\n' +
+      `Done, Sharik 🎉 One commit pushed. Vercel is deploying — site updates in ~60s.`
+    );
+
+  } catch (e) {
+    const msg = e?.response?.data?.message || e.message;
+    await sendMessage(chatId, `Something went wrong, Sharik: ${msg}\n\nTry /commit again.`);
+    console.error(e?.response?.data || e.message);
   }
 }
 
 async function downloadFileAsBase64(fileId) {
-  const fileInfo = await axios.get(
-    `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getFile?file_id=${fileId}`
-  );
+  const fileInfo = await axios.get(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/getFile?file_id=${fileId}`);
   const filePath = fileInfo.data.result.file_path;
   const fileRes  = await axios.get(
     `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${filePath}`,
@@ -586,17 +661,15 @@ function buildMarkdown(item) {
   if (item.areaSqft)    fm.push(`areaSqft: ${item.areaSqft}`);
   if (item.price)       fm.push(`price: ${item.price}`);
   if (item.mapLink)     fm.push(`mapLink: ${item.mapLink}`);
-  if (item.variant)     fm.push(`variant: ${item.variant}`);
+  if (item.isReno)      fm.push(`isRenovation: true`);
   if (item.amenities && item.amenities.length > 0) {
     fm.push(`amenities:`);
     for (const a of item.amenities) fm.push(`  - ${a}`);
   }
   fm.push('---');
-
   const lines = [fm.join('\n')];
   if (item.tagline)     lines.push(`\n# ${item.tagline}`);
   if (item.description) lines.push(`\n${item.description}`);
-
   return lines.join('\n');
 }
 
@@ -609,19 +682,20 @@ function finaliseItem(current) {
     slug:         slug(current.name),
     name:         current.name,
     category:     current.category,
-    variant:      current.variant     || null,
-    location:     current.location    || null,
-    badge:        current.badge       || null,
-    yearStarted:  current.yearStarted || null,
-    plots:        current.plots       || null,
-    areaSqft:     current.areaSqft    || null,
-    price:        current.price       || null,
-    mapLink:      current.mapLink     || null,
-    amenities:    current.amenities   || [],
-    tagline:      current.tagline     || null,
-    description:  current.description || null,
-    coverFileId:  current.coverFileId,
-    coverExt:     current.coverExt,
+    isReno:       current.isReno       || false,
+    renoFiles:    current.renoFiles    || [],
+    coverFileId:  current.coverFileId  || null,
+    coverExt:     current.coverExt     || null,
+    location:     current.location     || null,
+    badge:        current.badge        || null,
+    yearStarted:  current.yearStarted  || null,
+    plots:        current.plots        || null,
+    areaSqft:     current.areaSqft     || null,
+    price:        current.price        || null,
+    mapLink:      current.mapLink      || null,
+    amenities:    current.amenities    || [],
+    tagline:      current.tagline      || null,
+    description:  current.description  || null,
     galleryFiles: current.galleryFiles || [],
   };
 }
@@ -638,10 +712,13 @@ async function handleQueue(chatId) {
   }
   const lines = [`Queued for publishing (${session.queue.length}):`];
   session.queue.forEach((item, i) => {
-    lines.push('', `${i + 1}. *${item.name}* — ${item.category}`);
+    lines.push('', `${i + 1}. *${item.name}* — ${item.category}${item.isReno ? ' (Renovation)' : ''}`);
     if (item.location) lines.push(`   📍 ${item.location}`);
     if (item.badge)    lines.push(`   🏷 ${item.badge}`);
-    lines.push(`   🖼 ${1 + item.galleryFiles.length} photo(s)`);
+    const photoCount = item.isReno
+      ? item.renoFiles.length + item.galleryFiles.length
+      : 1 + item.galleryFiles.length;
+    lines.push(`   🖼 ${photoCount} photo(s)`);
   });
   await sendMessageWithKeyboard(chatId, lines.join('\n'), [
     [{ text: '🚀 Publish now', callback_data: 'more:commit'  }],
@@ -665,14 +742,10 @@ async function handleList(chatId) {
     if (e?.response?.status === 404) { await sendMessage(chatId, 'No projects live yet, Sharik.'); return; }
     throw e;
   }
-
   const folders = entries.filter(e => e.type === 'dir');
   if (folders.length === 0) { await sendMessage(chatId, 'No projects live yet, Sharik.'); return; }
-
   const lines = [`Sharik, you\'ve got *${folders.length}* project${folders.length === 1 ? '' : 's'} live:\n`];
-  for (const f of folders.sort((a, b) => a.name.localeCompare(b.name))) {
-    lines.push(`  • ${titleCase(f.name)}`);
-  }
+  for (const f of folders.sort((a, b) => a.name.localeCompare(b.name))) lines.push(`  • ${titleCase(f.name)}`);
   lines.push('\nUse /delete to remove a project or specific photo.');
   await sendMessage(chatId, lines.join('\n'));
 }
@@ -711,44 +784,23 @@ async function showDeleteProjectMenu(chatId) {
     if (e?.response?.status === 404) { await sendMessage(chatId, 'No projects to delete.'); return; }
     throw e;
   }
-
   const folders = entries.filter(e => e.type === 'dir').sort((a, b) => a.name.localeCompare(b.name));
   if (folders.length === 0) { await sendMessage(chatId, 'No projects to delete.'); return; }
-
   const tokens = ensureDeleteTokens(chatId);
   tokens.clear();
-
-  const keyboard = folders.map((f, i) => {
-    tokens.set(String(i), f.name);
-    return [{ text: titleCase(f.name), callback_data: `del:proj:${i}` }];
-  });
+  const keyboard = folders.map((f, i) => { tokens.set(String(i), f.name); return [{ text: titleCase(f.name), callback_data: `del:proj:${i}` }]; });
   keyboard.push([{ text: '✕ Close', callback_data: 'del:cancel' }]);
-
   await sendMessageWithKeyboard(chatId, 'Which project, Sharik?', keyboard);
 }
 
 async function handleDeleteCallback(chatId, messageId, payload) {
-  if (payload === 'cancel') {
-    await editMessage(chatId, messageId, 'Closed. Nothing deleted.');
-    deleteTokens(chatId);
-    return;
-  }
+  if (payload === 'cancel') { await editMessage(chatId, messageId, 'Closed. Nothing deleted.'); deleteTokens(chatId); return; }
+  if (payload === 'back')   { await editMessage(chatId, messageId, 'Loading...'); await showDeleteProjectMenu(chatId); return; }
 
-  // Back to project list
-  if (payload === 'back') {
-    await editMessage(chatId, messageId, 'Loading...');
-    await showDeleteProjectMenu(chatId);
-    return;
-  }
-
-  // Select project from menu
   if (payload.startsWith('proj:')) {
-    const token    = payload.slice(5);
-    const tokens   = getDeleteTokens(chatId);
-    const projSlug = tokens?.get(token);
+    const token = payload.slice(5); const tokens = getDeleteTokens(chatId); const projSlug = tokens?.get(token);
     if (!projSlug) { await editMessage(chatId, messageId, 'Selection expired. Run /delete again.'); return; }
-    await editMessageWithKeyboard(chatId, messageId,
-      `*${titleCase(projSlug)}* — what would you like to delete?`,
+    await editMessageWithKeyboard(chatId, messageId, `*${titleCase(projSlug)}* — what would you like to delete?`,
       [
         [{ text: '🗑 Entire project',   callback_data: `del:entire:${token}`  }],
         [{ text: '🖼 A specific photo', callback_data: `del:photos:${token}`  }],
@@ -759,14 +811,10 @@ async function handleDeleteCallback(chatId, messageId, payload) {
     return;
   }
 
-  // Confirm entire project delete (from menu)
   if (payload.startsWith('entire:')) {
-    const token    = payload.slice(7);
-    const tokens   = getDeleteTokens(chatId);
-    const projSlug = tokens?.get(token);
+    const token = payload.slice(7); const tokens = getDeleteTokens(chatId); const projSlug = tokens?.get(token);
     if (!projSlug) { await editMessage(chatId, messageId, 'Selection expired.'); return; }
-    await editMessageWithKeyboard(chatId, messageId,
-      `Confirm: delete the entire *${titleCase(projSlug)}* project and all its photos?`,
+    await editMessageWithKeyboard(chatId, messageId, `Confirm: delete the entire *${titleCase(projSlug)}* project?`,
       [
         [{ text: '🗑 Yes, delete everything', callback_data: `del:entireconfirm:${token}` }],
         [{ text: '↩ Back',                    callback_data: `del:proj:${token}`           }],
@@ -776,28 +824,18 @@ async function handleDeleteCallback(chatId, messageId, payload) {
     return;
   }
 
-  // Confirmed — delete entire folder (from menu token)
   if (payload.startsWith('entireconfirm:')) {
-    const token    = payload.slice(14);
-    const tokens   = getDeleteTokens(chatId);
-    const projSlug = tokens?.get(token);
+    const token = payload.slice(14); const tokens = getDeleteTokens(chatId); const projSlug = tokens?.get(token);
     if (!projSlug) { await editMessage(chatId, messageId, 'Selection expired.'); return; }
     await editMessage(chatId, messageId, `Deleting *${titleCase(projSlug)}*...`);
-    try {
-      await deleteFolderContents(projSlug);
-      deleteTokens(chatId);
-      await editMessage(chatId, messageId, `✓ *${titleCase(projSlug)}* deleted. Site updates in ~60s.`);
-    } catch (e) {
-      await editMessage(chatId, messageId, `Failed: ${e?.response?.data?.message || e.message}`);
-    }
+    try { await deleteFolderContents(projSlug); deleteTokens(chatId); await editMessage(chatId, messageId, `✓ *${titleCase(projSlug)}* deleted. Site updates in ~60s.`); }
+    catch (e) { await editMessage(chatId, messageId, `Failed: ${e?.response?.data?.message || e.message}`); }
     return;
   }
 
-  // Direct entire delete (from /delete <slug> path)
   if (payload.startsWith('entiredirect:')) {
     const projSlug = payload.slice(13);
-    await editMessageWithKeyboard(chatId, messageId,
-      `Confirm: delete the entire *${titleCase(projSlug)}* project?`,
+    await editMessageWithKeyboard(chatId, messageId, `Confirm: delete the entire *${titleCase(projSlug)}* project?`,
       [
         [{ text: '🗑 Yes, delete everything', callback_data: `del:entiredirectconfirm:${projSlug}` }],
         [{ text: '✕ Cancel',                  callback_data: `del:cancel`                          }],
@@ -809,40 +847,28 @@ async function handleDeleteCallback(chatId, messageId, payload) {
   if (payload.startsWith('entiredirectconfirm:')) {
     const projSlug = payload.slice(20);
     await editMessage(chatId, messageId, `Deleting *${titleCase(projSlug)}*...`);
-    try {
-      await deleteFolderContents(projSlug);
-      await editMessage(chatId, messageId, `✓ *${titleCase(projSlug)}* deleted. Site updates in ~60s.`);
-    } catch (e) {
-      await editMessage(chatId, messageId, `Failed: ${e?.response?.data?.message || e.message}`);
-    }
+    try { await deleteFolderContents(projSlug); await editMessage(chatId, messageId, `✓ *${titleCase(projSlug)}* deleted. Site updates in ~60s.`); }
+    catch (e) { await editMessage(chatId, messageId, `Failed: ${e?.response?.data?.message || e.message}`); }
     return;
   }
 
-  // Show photo list (from menu token)
   if (payload.startsWith('photos:')) {
-    const token    = payload.slice(7);
-    const tokens   = getDeleteTokens(chatId);
-    const projSlug = tokens?.get(token);
+    const token = payload.slice(7); const tokens = getDeleteTokens(chatId); const projSlug = tokens?.get(token);
     if (!projSlug) { await editMessage(chatId, messageId, 'Selection expired.'); return; }
     await showPhotoDeleteMenu(chatId, messageId, projSlug, `del:proj:${token}`);
     return;
   }
 
-  // Show photo list (direct path)
   if (payload.startsWith('photosdirect:')) {
     const projSlug = payload.slice(13);
     await showPhotoDeleteMenu(chatId, messageId, projSlug, 'del:cancel');
     return;
   }
 
-  // Delete specific photo confirm
   if (payload.startsWith('photo:')) {
-    const key      = payload.slice(6);
-    const tokens   = getDeleteTokens(chatId);
-    const filePath = tokens?.get(`photo:${key}`);
+    const key = payload.slice(6); const tokens = getDeleteTokens(chatId); const filePath = tokens?.get(`photo:${key}`);
     if (!filePath) { await editMessage(chatId, messageId, 'Selection expired.'); return; }
-    await editMessageWithKeyboard(chatId, messageId,
-      `Confirm: delete *${filePath.split('/').pop()}*?`,
+    await editMessageWithKeyboard(chatId, messageId, `Confirm: delete *${filePath.split('/').pop()}*?`,
       [
         [{ text: '🗑 Yes, delete it', callback_data: `del:photoconfirm:${key}` }],
         [{ text: '✕ Cancel',          callback_data: `del:cancel`               }],
@@ -851,25 +877,19 @@ async function handleDeleteCallback(chatId, messageId, payload) {
     return;
   }
 
-  // Confirmed — delete specific photo
   if (payload.startsWith('photoconfirm:')) {
-    const key      = payload.slice(13);
-    const tokens   = getDeleteTokens(chatId);
-    const filePath = tokens?.get(`photo:${key}`);
+    const key = payload.slice(13); const tokens = getDeleteTokens(chatId); const filePath = tokens?.get(`photo:${key}`);
     if (!filePath) { await editMessage(chatId, messageId, 'Selection expired.'); return; }
     await editMessage(chatId, messageId, `Deleting *${filePath.split('/').pop()}*...`);
     try {
       const sha = await ghGetSha(`${GH_CONTENTS_PATH}/${filePath}`, true);
       if (!sha) { await editMessage(chatId, messageId, 'File not found — already deleted?'); return; }
-      await axios.delete(
-        ghContentsUrlFull(`${GH_CONTENTS_PATH}/${filePath}`),
+      await axios.delete(ghContentsUrlFull(`${GH_CONTENTS_PATH}/${filePath}`),
         { headers: ghHeaders(), data: { message: `Remove: ${filePath}`, sha, branch: GITHUB_BRANCH } }
       );
       deleteTokens(chatId);
       await editMessage(chatId, messageId, `✓ *${filePath.split('/').pop()}* deleted. Site updates in ~60s.`);
-    } catch (e) {
-      await editMessage(chatId, messageId, `Failed: ${e?.response?.data?.message || e.message}`);
-    }
+    } catch (e) { await editMessage(chatId, messageId, `Failed: ${e?.response?.data?.message || e.message}`); }
     return;
   }
 }
@@ -882,22 +902,13 @@ async function showPhotoDeleteMenu(chatId, messageId, projSlug, backCallback) {
       { headers: ghHeaders(), params: { ref: GITHUB_BRANCH } }
     );
     files = Array.isArray(r.data) ? r.data.filter(f => f.type === 'file' && !f.name.endsWith('.md')) : [];
-  } catch (e) {
-    await editMessage(chatId, messageId, 'Could not fetch photo list.'); return;
-  }
-
+  } catch (e) { await editMessage(chatId, messageId, 'Could not fetch photo list.'); return; }
   if (files.length === 0) { await editMessage(chatId, messageId, 'No photos found in this project.'); return; }
-
   const photoTokens = ensureDeleteTokens(chatId);
   files.forEach((f, i) => photoTokens.set(`photo:${i}`, `${projSlug}/${f.name}`));
-
   const keyboard = files.map((f, i) => [{ text: f.name, callback_data: `del:photo:${i}` }]);
-  keyboard.push([{ text: '↩ Back',   callback_data: backCallback  }]);
-  keyboard.push([{ text: '✕ Cancel', callback_data: 'del:cancel'  }]);
-
-  await editMessageWithKeyboard(chatId, messageId,
-    `Which photo from *${titleCase(projSlug)}*?`, keyboard
-  );
+  keyboard.push([{ text: '↩ Back', callback_data: backCallback }, { text: '✕ Cancel', callback_data: 'del:cancel' }]);
+  await editMessageWithKeyboard(chatId, messageId, `Which photo from *${titleCase(projSlug)}*?`, keyboard);
 }
 
 async function deleteFolderContents(projSlug) {
@@ -923,17 +934,11 @@ function ghContentsUrlFull(path) {
 }
 
 function ghHeaders() {
-  return {
-    Authorization: `Bearer ${GITHUB_TOKEN}`,
-    Accept:        'application/vnd.github+json',
-    'User-Agent':  'cosmos-bot',
-  };
+  return { Authorization: `Bearer ${GITHUB_TOKEN}`, Accept: 'application/vnd.github+json', 'User-Agent': 'cosmos-bot' };
 }
 
 async function ghGetSha(path, fullPath = false) {
-  const url = fullPath
-    ? ghContentsUrlFull(path)
-    : ghContentsUrlFull(`${GH_CONTENTS_PATH}/${path}`);
+  const url = fullPath ? ghContentsUrlFull(path) : ghContentsUrlFull(`${GH_CONTENTS_PATH}/${path}`);
   try {
     const r = await axios.get(url, { headers: ghHeaders(), params: { ref: GITHUB_BRANCH } });
     return r.data.sha;
@@ -956,82 +961,43 @@ function getSession(chatId) {
 }
 
 function touch(s) { s.updatedAt = Date.now(); }
-
-function ensureDeleteTokens(chatId) {
-  let m = DELETE_TOKENS.get(chatId);
-  if (!m) { m = new Map(); DELETE_TOKENS.set(chatId, m); }
-  return m;
-}
-function getDeleteTokens(chatId) { return DELETE_TOKENS.get(chatId); }
-function deleteTokens(chatId)    { DELETE_TOKENS.delete(chatId); }
+function ensureDeleteTokens(chatId) { let m = DELETE_TOKENS.get(chatId); if (!m) { m = new Map(); DELETE_TOKENS.set(chatId, m); } return m; }
+function getDeleteTokens(chatId)    { return DELETE_TOKENS.get(chatId); }
+function deleteTokens(chatId)       { DELETE_TOKENS.delete(chatId); }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 function slug(raw) {
-  return raw
-    .replace(/[^A-Za-z0-9\s_-]+/g, '')
-    .split(/[\s_-]+/)
-    .filter(Boolean)
-    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-    .join('-')
-    .toLowerCase();
+  return raw.replace(/[^A-Za-z0-9\s_-]+/g, '').split(/[\s_-]+/).filter(Boolean)
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join('-').toLowerCase();
 }
 
-function titleCase(s) {
-  return s.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-}
-
-function isSkip(text) {
-  return SKIP_TOKENS.includes((text || '').toLowerCase().trim());
-}
+function titleCase(s) { return s.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()); }
+function isSkip(text) { return SKIP_TOKENS.includes((text || '').toLowerCase().trim()); }
 
 function prettyStepName(step) {
-  const map = {
-    location:    'Location',
-    badge:       'Badge',
-    yearStarted: 'Year started',
-    plots:       'Plots',
-    areaSqft:    'Area',
-    price:       'Price',
-    mapLink:     'Map link',
-    amenities:   'Amenities',
-    tagline:     'Tagline',
-    description: 'Description',
-  };
+  const map = { location: 'Location', badge: 'Badge', yearStarted: 'Year started', plots: 'Plots', areaSqft: 'Area', price: 'Price', mapLink: 'Map link', amenities: 'Amenities', tagline: 'Tagline', description: 'Description' };
   return map[step] || step;
 }
 
 function extractIncomingMedia(message) {
   if (message.document) {
-    const d   = message.document;
-    const ext = guessExt(d.file_name, d.mime_type);
+    const d = message.document; const ext = guessExt(d.file_name, d.mime_type);
     if (!ext) return null;
     return { fileId: d.file_id, ext, fileSize: d.file_size, warn: null };
   }
   if (Array.isArray(message.photo) && message.photo.length > 0) {
     const largest = message.photo.reduce((a, b) => (a.file_size || 0) >= (b.file_size || 0) ? a : b);
-    return {
-      fileId:   largest.file_id,
-      ext:      'jpg',
-      fileSize: largest.file_size,
-      warn:     '⚠️ Sent as compressed photo. For best quality, send as a *file* next time.',
-    };
+    return { fileId: largest.file_id, ext: 'jpg', fileSize: largest.file_size, warn: '⚠️ Sent as compressed photo. For best quality, send as a *file* next time.' };
   }
   return null;
 }
 
 function guessExt(filename, mimeType) {
-  if (filename) {
-    const ext = (filename.split('.').pop() || '').toLowerCase();
-    if (VALID_EXTS.includes(ext)) return ext;
-  }
-  if (mimeType) {
-    if (mimeType === 'image/jpeg') return 'jpg';
-    if (mimeType === 'image/png')  return 'png';
-    if (mimeType === 'image/webp') return 'webp';
-  }
+  if (filename) { const ext = (filename.split('.').pop() || '').toLowerCase(); if (VALID_EXTS.includes(ext)) return ext; }
+  if (mimeType) { if (mimeType === 'image/jpeg') return 'jpg'; if (mimeType === 'image/png') return 'png'; if (mimeType === 'image/webp') return 'webp'; }
   return null;
 }
 
@@ -1042,18 +1008,18 @@ function guessExt(filename, mimeType) {
 function helpText() {
   return (
     'Hey Sharik 👋  Cosmos showcase manager.\n\n' +
-    'To add a new property:\n' +
+    'To add a property:\n' +
     '  1. Send the *cover photo* as a file.\n' +
-    '  2. I\'ll ask for all details — name, section, location, badge,\n' +
-    '     year, plots, area, price, map link, amenities, tagline, description.\n' +
-    '  3. Then I\'ll ask if you have gallery photos.\n' +
-    '  4. Tap *Publish* — site updates in ~60s.\n\n' +
+    '  2. I\'ll ask for all details.\n' +
+    '  3. For Renovation — I\'ll ask if it\'s Before or After, then ask for the matching photo.\n' +
+    '  4. I\'ll ask if you have gallery photos.\n' +
+    '  5. Tap *Publish* — one commit, site updates in ~60s.\n\n' +
     'Commands:\n' +
     '  /list   — see live projects\n' +
     '  /queue  — see what\'s waiting to publish\n' +
     '  /commit — publish the queue now\n' +
     '  /cancel — clear everything and start over\n' +
-    '  /delete — remove a project or specific photo\n' +
+    '  /delete — remove a project or photo\n' +
     '  /help   — this message'
   );
 }
@@ -1066,11 +1032,8 @@ async function sendMessage(chatId, text) {
   await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
     { chat_id: chatId, text, parse_mode: 'Markdown' }
   ).catch(async (e) => {
-    if (e?.response?.data?.description?.includes('parse')) {
-      await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
-        { chat_id: chatId, text }
-      );
-    } else throw e;
+    if (e?.response?.data?.description?.includes('parse')) await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, { chat_id: chatId, text });
+    else throw e;
   });
 }
 
@@ -1078,11 +1041,8 @@ async function sendMessageWithKeyboard(chatId, text, inline_keyboard) {
   await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
     { chat_id: chatId, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard } }
   ).catch(async (e) => {
-    if (e?.response?.data?.description?.includes('parse')) {
-      await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
-        { chat_id: chatId, text, reply_markup: { inline_keyboard } }
-      );
-    } else throw e;
+    if (e?.response?.data?.description?.includes('parse')) await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, { chat_id: chatId, text, reply_markup: { inline_keyboard } });
+    else throw e;
   });
 }
 
@@ -1092,13 +1052,8 @@ async function editMessage(chatId, messageId, text) {
     { chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown' }
   ).catch(async (e) => {
     const desc = e?.response?.data?.description || '';
-    if (desc.includes('parse')) {
-      await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`,
-        { chat_id: chatId, message_id: messageId, text }
-      );
-    } else if (!desc.includes('not modified')) {
-      await sendMessage(chatId, text);
-    }
+    if (desc.includes('parse')) await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`, { chat_id: chatId, message_id: messageId, text });
+    else if (!desc.includes('not modified')) await sendMessage(chatId, text);
   });
 }
 
@@ -1108,13 +1063,8 @@ async function editMessageWithKeyboard(chatId, messageId, text, inline_keyboard)
     { chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown', reply_markup: { inline_keyboard } }
   ).catch(async (e) => {
     const desc = e?.response?.data?.description || '';
-    if (desc.includes('parse')) {
-      await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`,
-        { chat_id: chatId, message_id: messageId, text, reply_markup: { inline_keyboard } }
-      );
-    } else if (!desc.includes('not modified')) {
-      await sendMessageWithKeyboard(chatId, text, inline_keyboard);
-    }
+    if (desc.includes('parse')) await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText`, { chat_id: chatId, message_id: messageId, text, reply_markup: { inline_keyboard } });
+    else if (!desc.includes('not modified')) await sendMessageWithKeyboard(chatId, text, inline_keyboard);
   });
 }
 
