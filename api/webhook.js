@@ -196,107 +196,135 @@ async function onLocation(chatId, session, text) {
     if (cleaned.length > 40) { await sendMessage(chatId, 'Location too long (max 40 chars). Try again or "skip".'); return; }
     session.current.location = cleaned;
   }
-  session.step = 'badge';
-  touch(session);
-  await sendMessage(chatId,
-    `*4 / 12*  *Badge text*?  (optional)\n\n` +
-    `Small crimson pill on the card — e.g. "42 Plots", "Sold Out", "Phase 2".\n` +
-    `Send text or "skip".`
-  );
+  await goToStep(chatId, session, 'badge');
 }
 
 async function onBadge(chatId, session, text) {
   if (!isSkip(text)) {
     const cleaned = text.replace(/\s+/g, ' ').trim();
-    if (cleaned.length > 30) { await sendMessage(chatId, 'Badge too long (max 30 chars). Try again or "skip".'); return; }
+    if (cleaned.length > 30) { await sendMessage(chatId, 'Badge too long (max 30 chars). Try again or tap Skip.'); return; }
     session.current.badge = cleaned;
   }
-  session.step = 'yearStarted';
-  touch(session);
-  await sendMessage(chatId, `*5 / 12*  *Year started*?  (optional)\n\nE.g. 2022. Send the year or "skip".`);
+  await goToStep(chatId, session, 'yearStarted');
 }
 
 async function onYearStarted(chatId, session, text) {
   if (!isSkip(text)) {
-    if (!/^\d{4}$/.test(text.trim())) { await sendMessage(chatId, 'Please send a 4-digit year like 2022, or "skip".'); return; }
+    if (!/^\d{4}$/.test(text.trim())) { await sendMessage(chatId, 'Please send a 4-digit year like 2022, or tap Skip.'); return; }
     session.current.yearStarted = text.trim();
   }
-  session.step = 'plots';
-  touch(session);
-  await sendMessage(chatId, `*6 / 12*  *Number of plots*?  (optional)\n\nE.g. 42. Send the number or "skip".`);
+  await goToStep(chatId, session, 'plots');
 }
 
 async function onPlots(chatId, session, text) {
   if (!isSkip(text)) session.current.plots = text.replace(/\s+/g, ' ').trim();
-  session.step = 'areaSqft';
-  touch(session);
-  await sendMessage(chatId, `*7 / 12*  *Plot area (sqft)*?  (optional)\n\nE.g. "1200 – 2400". Send or "skip".`);
+  await goToStep(chatId, session, 'areaSqft');
 }
 
 async function onAreaSqft(chatId, session, text) {
   if (!isSkip(text)) session.current.areaSqft = text.replace(/\s+/g, ' ').trim();
-  session.step = 'price';
-  touch(session);
-  await sendMessage(chatId, `*8 / 12*  *Starting price*?  (optional)\n\nE.g. "From ₹48 L". Send or "skip".`);
+  await goToStep(chatId, session, 'price');
 }
 
 async function onPrice(chatId, session, text) {
   if (!isSkip(text)) session.current.price = text.replace(/\s+/g, ' ').trim();
-  session.step = 'mapLink';
-  touch(session);
-  await sendMessage(chatId, `*9 / 12*  *Google Maps link*?  (optional)\n\nPaste the link or "skip".`);
+  await goToStep(chatId, session, 'mapLink');
 }
 
 async function onMapLink(chatId, session, text) {
   if (!isSkip(text)) {
-    if (!text.startsWith('http')) { await sendMessage(chatId, 'Please send a valid URL starting with http, or "skip".'); return; }
+    if (!text.startsWith('http')) { await sendMessage(chatId, 'Please send a valid URL starting with http, or tap Skip.'); return; }
     session.current.mapLink = text.trim();
   }
-  session.step = 'amenities';
-  touch(session);
-  await sendMessage(chatId,
-    `*10 / 12*  *Amenities*?  (optional)\n\n` +
-    `Send as comma-separated list:\n` +
-    `_Gated community, 30ft roads, Solar lighting_\n\nOr "skip".`
-  );
+  await goToStep(chatId, session, 'amenities');
 }
 
 async function onAmenities(chatId, session, text) {
   if (!isSkip(text)) {
     session.current.amenities = text.split(',').map(s => s.trim()).filter(Boolean);
   }
-  session.step = 'tagline';
-  touch(session);
-  await sendMessage(chatId,
-    `*11 / 12*  *Property tagline*?  (optional)\n\n` +
-    `One punchy heading line — e.g. _"A garden address, a forever home"_\n\nSend or "skip".`
-  );
+  await goToStep(chatId, session, 'tagline');
 }
 
 async function onTagline(chatId, session, text) {
   if (!isSkip(text)) session.current.tagline = text.replace(/\s+/g, ' ').trim();
-  session.step = 'description';
-  touch(session);
-  await sendMessage(chatId,
-    `*12 / 12*  *Property description*?  (optional)\n\n` +
-    `A few sentences about the property — location, highlights, why it\'s great.\n` +
-    `Plain text is fine.\n\nSend or "skip".`
-  );
+  await goToStep(chatId, session, 'description');
 }
 
 async function onDescription(chatId, session, text) {
   if (!isSkip(text)) session.current.description = text.trim();
-  session.step = 'gallery';
+  await goToStep(chatId, session, 'gallery');
+}
+
+// ---------------------------------------------------------------------------
+// Step prompts — central place for the question text + skip-button keyboard
+// ---------------------------------------------------------------------------
+
+const STEP_PROMPTS = {
+  badge: {
+    text:
+      `*4 / 12*  *Badge text*?  (optional)\n\n` +
+      `Small crimson pill on the card — e.g. "42 Plots", "Sold Out", "Phase 2".\n` +
+      `Send text or tap Skip.`,
+  },
+  yearStarted: {
+    text: `*5 / 12*  *Year started*?  (optional)\n\nE.g. 2022. Send the year or tap Skip.`,
+  },
+  plots: {
+    text: `*6 / 12*  *Number of plots*?  (optional)\n\nE.g. 42. Send the number or tap Skip.`,
+  },
+  areaSqft: {
+    text: `*7 / 12*  *Plot area (sqft)*?  (optional)\n\nE.g. "1200 – 2400". Send or tap Skip.`,
+  },
+  price: {
+    text: `*8 / 12*  *Starting price*?  (optional)\n\nE.g. "From ₹48 L". Send or tap Skip.`,
+  },
+  mapLink: {
+    text: `*9 / 12*  *Google Maps link*?  (optional)\n\nPaste the link or tap Skip.`,
+  },
+  amenities: {
+    text:
+      `*10 / 12*  *Amenities*?  (optional)\n\n` +
+      `Send as comma-separated list:\n` +
+      `_Gated community, 30ft roads, Solar lighting_\n\nOr tap Skip.`,
+  },
+  tagline: {
+    text:
+      `*11 / 12*  *Property tagline*?  (optional)\n\n` +
+      `One punchy heading line — e.g. _"A garden address, a forever home"_\n\nSend or tap Skip.`,
+  },
+  description: {
+    text:
+      `*12 / 12*  *Property description*?  (optional)\n\n` +
+      `A few sentences about the property — location, highlights, why it\'s great.\n` +
+      `Plain text is fine.\n\nSend or tap Skip.`,
+  },
+};
+
+function skipKeyboard(step) {
+  return [[{ text: '⏭ Skip', callback_data: `skip:${step}` }]];
+}
+
+async function goToStep(chatId, session, step) {
+  session.step = step;
   touch(session);
-  await sendMessageWithKeyboard(chatId,
-    `All details collected ✓\n\n` +
-    `Does this property have *additional gallery photos*?\n` +
-    `(Cover is already saved — these appear inside the detail page.)`,
-    [
-      [{ text: '📸 Yes, I have more photos', callback_data: 'gallery:yes'  }],
-      [{ text: '✅ No, that\'s it',           callback_data: 'gallery:done' }],
-    ]
-  );
+
+  if (step === 'gallery') {
+    await sendMessageWithKeyboard(chatId,
+      `All details collected ✓\n\n` +
+      `Does this property have *additional gallery photos*?\n` +
+      `(Cover is already saved — these appear inside the detail page.)`,
+      [
+        [{ text: '📸 Yes, I have more photos', callback_data: 'gallery:yes'  }],
+        [{ text: '✅ No, that\'s it',           callback_data: 'gallery:done' }],
+      ]
+    );
+    return;
+  }
+
+  const prompt = STEP_PROMPTS[step];
+  if (!prompt) return;
+  await sendMessageWithKeyboard(chatId, prompt.text, skipKeyboard(step));
 }
 
 async function onMore(chatId, session, text) {
@@ -345,9 +373,10 @@ async function handleCallbackQuery(cq) {
     session.step = 'location';
     touch(session);
     await editMessage(chatId, messageId, `Section: *${cat}* ✓`);
-    await sendMessage(chatId,
+    await sendMessageWithKeyboard(chatId,
       `*3 / 12*  *Location* to show on the card?  (optional)\n\n` +
-      `E.g. "Karaikal" or "ECR Chennai". Send or "skip".`
+      `E.g. "Karaikal" or "ECR Chennai". Send or tap Skip.`,
+      skipKeyboard('location')
     );
     return;
   }
@@ -361,9 +390,36 @@ async function handleCallbackQuery(cq) {
     session.step = 'location';
     touch(session);
     await editMessage(chatId, messageId, `Variant: *${variant}* ✓`);
-    await sendMessage(chatId,
-      `*3 / 12*  *Location* to show on the card?  (optional)\n\nSend or "skip".`
+    await sendMessageWithKeyboard(chatId,
+      `*3 / 12*  *Location* to show on the card?  (optional)\n\nSend or tap Skip.`,
+      skipKeyboard('location')
     );
+    return;
+  }
+
+  // Skip an optional field — advance to the next step without setting anything
+  if (data.startsWith('skip:')) {
+    const step    = data.slice(5);
+    const session = getSession(chatId);
+    if (session.step !== step) return;
+
+    const NEXT = {
+      location:    'badge',
+      badge:       'yearStarted',
+      yearStarted: 'plots',
+      plots:       'areaSqft',
+      areaSqft:    'price',
+      price:       'mapLink',
+      mapLink:     'amenities',
+      amenities:   'tagline',
+      tagline:     'description',
+      description: 'gallery',
+    };
+    const nextStep = NEXT[step];
+    if (!nextStep) return;
+
+    await editMessage(chatId, messageId, `${prettyStepName(step)}: _skipped_`);
+    await goToStep(chatId, session, nextStep);
     return;
   }
 
@@ -929,6 +985,22 @@ function titleCase(s) {
 
 function isSkip(text) {
   return SKIP_TOKENS.includes((text || '').toLowerCase().trim());
+}
+
+function prettyStepName(step) {
+  const map = {
+    location:    'Location',
+    badge:       'Badge',
+    yearStarted: 'Year started',
+    plots:       'Plots',
+    areaSqft:    'Area',
+    price:       'Price',
+    mapLink:     'Map link',
+    amenities:   'Amenities',
+    tagline:     'Tagline',
+    description: 'Description',
+  };
+  return map[step] || step;
 }
 
 function extractIncomingMedia(message) {
