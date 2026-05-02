@@ -140,16 +140,11 @@ async function routeMessage(chatId, message, text) {
     // Waiting for the second renovation image
     if (session.step === 'reno_wait_second') {
       if (incoming.warn) await sendMessage(chatId, incoming.warn);
-      const label = session.current.waitingLabel; // 'Before' or 'After'
+      const label = session.current.waitingLabel;
       session.current.renoFiles.push({ fileId: incoming.fileId, ext: incoming.ext, label });
       session.current.waitingLabel = null;
-      session.step = 'name';
-      touch(session);
-      await sendMessage(chatId,
-        `Got the *${label}* photo ✓\n\n` +
-        `Now let\'s fill in the property details.\n\n` +
-        `*1 / 12*  What\'s the *property name*?  (e.g. Falcon House)`
-      );
+      // Name and category already collected — jump straight to location
+      await goToStep(chatId, session, 'location');
       return;
     }
 
@@ -385,7 +380,7 @@ async function handleCallbackQuery(cq) {
 
   // ── Renovation: label the first uploaded image ────────────────────────────
   if (data.startsWith('renolabel:')) {
-    const label   = data.slice(10); // 'Before' or 'After'
+    const label   = data.slice(10);
     const session = getSession(chatId);
     if (session.step !== 'reno_label_first') return;
 
@@ -395,9 +390,8 @@ async function handleCallbackQuery(cq) {
       ext:    session.current.coverExt,
       label,
     });
-    // Clear coverFileId — renovation uses renoFiles instead
-    session.current.coverFileId = null;
-    session.current.coverExt    = null;
+    session.current.coverFileId  = null;
+    session.current.coverExt     = null;
 
     const needed = label === 'Before' ? 'After' : 'Before';
     session.current.waitingLabel = needed;
@@ -406,8 +400,7 @@ async function handleCallbackQuery(cq) {
 
     await editMessage(chatId, messageId, `*${label}* photo saved ✓`);
     await sendMessage(chatId,
-      `Now send the *${needed}* photo for this renovation project.\n\n` +
-      `Send it as a file for best quality.`
+      `Now send the *${needed}* photo.\n\nSend it as a file for best quality.`
     );
     return;
   }
