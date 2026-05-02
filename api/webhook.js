@@ -112,6 +112,10 @@ async function routeMessage(chatId, message, text) {
     session.current = {
       coverFileId:  incoming.fileId,
       coverExt:     incoming.ext,
+      beforeFileId: null,
+      beforeExt:    null,
+      afterFileId:  null,
+      afterExt:     null,
       galleryFiles: [],
     };
     session.step = 'name';
@@ -120,6 +124,32 @@ async function routeMessage(chatId, message, text) {
       `Got the cover image, Sharik. Let\'s set up this property.\n\n` +
       `*1 / 12*  What\'s the *property name*?  (e.g. Ruby Garden)\n\n` +
       `Send /cancel anytime to start over.`
+    );
+    return;
+  }
+
+  // Renovation before photo
+  if (incoming && session.step === 'renovation_before') {
+    if (incoming.warn) await sendMessage(chatId, incoming.warn);
+    session.current.beforeFileId = incoming.fileId;
+    session.current.beforeExt = incoming.ext;
+    session.step = 'renovation_after';
+    touch(session);
+    await sendMessage(chatId, `Got it. Now send the *After* photo.`);
+    return;
+  }
+
+  // Renovation after photo
+  if (incoming && session.step === 'renovation_after') {
+    if (incoming.warn) await sendMessage(chatId, incoming.warn);
+    session.current.afterFileId = incoming.fileId;
+    session.current.afterExt = incoming.ext;
+    session.step = 'location';
+    touch(session);
+    await sendMessageWithKeyboard(chatId,
+      `*3 / 12*  *Location* to show on the card?  (optional)\n\n` +
+      `E.g. "Karaikal" or "ECR Chennai". Send or tap Skip.`,
+      skipKeyboard('location')
     );
     return;
   }
@@ -357,16 +387,10 @@ async function handleCallbackQuery(cq) {
     session.current.category = cat;
 
     if (cat === 'Renovation') {
-      session.step = 'variant';
+      session.step = 'renovation_before';
       touch(session);
       await editMessage(chatId, messageId, `Section: *Renovation* ✓`);
-      await sendMessageWithKeyboard(chatId,
-        `*3a / 12*  Is this the *Before* or *After* photo?`,
-        [
-          [{ text: '⬅️ Before', callback_data: 'variant:Before' }],
-          [{ text: '➡️ After',  callback_data: 'variant:After'  }],
-        ]
-      );
+      await sendMessage(chatId, `Please send the *Before* photo.`);
       return;
     }
 
@@ -447,8 +471,9 @@ async function handleCallbackQuery(cq) {
         `  • cover.${item.coverExt}\n` +
         (item.galleryFiles.length > 0 ? `  • ${item.galleryFiles.length} gallery photo(s)\n` : '') +
         `  • ${item.slug}.md\n\n` +
-        `Send another image to queue more, or:`,
+        `What's next?`,
         [
+          [{ text: '➕ Add another property',   callback_data: 'more:add'     }],
           [{ text: '🚀 Publish everything now', callback_data: 'more:commit'  }],
           [{ text: '🗑 Discard all',             callback_data: 'more:discard' }],
         ]
@@ -461,6 +486,10 @@ async function handleCallbackQuery(cq) {
   // More / publish
   if (data.startsWith('more:')) {
     const action = data.slice(5);
+    if (action === 'add') {
+      await editMessage(chatId, messageId, 'Got it. Send the cover photo for the next property.');
+      return;
+    }
     if (action === 'commit')  { await handleCommit(chatId); return; }
     if (action === 'discard') {
       SESSIONS.delete(chatId);
@@ -556,6 +585,49 @@ async function commitProject(item) {
   }
 }
 
+async function commitRenovationProject(item) {
+  const files = [];
+
+  // Before image
+  const beforeContent = await downloadFileAsBase64(item.beforeFileId);
+  files.push({
+    path:    `${GH_CONTENTS_PATH}/${item.slug}/before.${item.beforeExt}`,
+    content: beforeContent,
+    message: `Add before image: ${item.slug}/before.${item.beforeExt}`,
+  });
+
+  // After image
+  const afterContent = await downloadFileAsBase64(item.afterFileId);
+  files.push({
+    path:    `${GH_CONTENTS_PATH}/${item.slug}/after.${item.afterExt}`,
+    content: afterContent,
+    message: `Add after image: ${item.slug}/after.${item.afterExt}`,
+  });
+
+  // Markdown file
+  const mdContent = Buffer.from(buildMarkdown(item)).toString('base64');
+  files.push({
+    path:    `${GH_CONTENTS_PATH}/${item.slug}/${item.slug}.md`,
+    content: mdContent,
+    message: `Add metadata: ${item.slug}/${item.slug}.md`,
+  });
+
+  // Commit each file to GitHub
+  for (const file of files) {
+    const sha = await ghGetSha(file.path, true);
+    await axios.put(
+      ghContentsUrlFull(file.path),
+      {
+        message: file.message,
+        content: file.content,
+        branch:  GITHUB_BRANCH,
+        ...(sha && { sha }),
+      },
+      { headers: ghHeaders() }
+    );
+  }
+}
+
 async function downloadFileAsBase64(fileId) {
   const fileInfo = await axios.get(
     `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getFile?file_id=${fileId}`
@@ -586,7 +658,6 @@ function buildMarkdown(item) {
   if (item.areaSqft)    fm.push(`areaSqft: ${item.areaSqft}`);
   if (item.price)       fm.push(`price: ${item.price}`);
   if (item.mapLink)     fm.push(`mapLink: ${item.mapLink}`);
-  if (item.variant)     fm.push(`variant: ${item.variant}`);
   if (item.amenities && item.amenities.length > 0) {
     fm.push(`amenities:`);
     for (const a of item.amenities) fm.push(`  - ${a}`);
@@ -609,7 +680,6 @@ function finaliseItem(current) {
     slug:         slug(current.name),
     name:         current.name,
     category:     current.category,
-    variant:      current.variant     || null,
     location:     current.location    || null,
     badge:        current.badge       || null,
     yearStarted:  current.yearStarted || null,
@@ -622,6 +692,10 @@ function finaliseItem(current) {
     description:  current.description || null,
     coverFileId:  current.coverFileId,
     coverExt:     current.coverExt,
+    beforeFileId: current.beforeFileId,
+    beforeExt:    current.beforeExt,
+    afterFileId:  current.afterFileId,
+    afterExt:     current.afterExt,
     galleryFiles: current.galleryFiles || [],
   };
 }
