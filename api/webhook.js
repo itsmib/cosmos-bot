@@ -42,8 +42,9 @@ const SKIP_TOKENS  = ['skip', 's', '-', ''];
 //
 // session.step values:
 //   idle | reno_label_first | reno_wait_second | name | category | location |
-//   badge | yearStarted | plots | areaSqft | price | mapLink | amenities |
-//   tagline | description | gallery | more
+//   badge | yearStarted | plots | plotsTotal | plotsSold | plotsAvailable |
+//   areaSqft | price | mapLink | amenities | tagline | description |
+//   youtubeId | gallery | more
 //
 // session.current for normal property:
 //   { coverFileId, coverExt, galleryFiles[], name, category, location?, ... }
@@ -55,6 +56,11 @@ const SKIP_TOKENS  = ['skip', 's', '-', ''];
 const SESSIONS      = new Map();
 const SESSION_TTL   = 30 * 60 * 1000;
 const DELETE_TOKENS = new Map();
+// Edit sessions are kept separate from the add-flow sessions above so an
+// in-progress upload doesn't collide with an /edit conversation. Shape:
+//   { slug, category, fm, body, pendingField, updatedAt }
+const EDIT_SESSIONS = new Map();
+const EDIT_TOKENS   = new Map();
 const SEEN_UPDATES  = new Set();
 const SEEN_MAX      = 200;
 
@@ -89,6 +95,7 @@ module.exports = async (req, res) => {
     if (text.startsWith('/cancel')) { SESSIONS.delete(chatId); await sendMessage(chatId, 'All clear, Sharik. Send an image whenever you\'re ready.'); return res.status(200).send('ok'); }
     if (text.startsWith('/list'))   { await handleList(chatId);         return res.status(200).send('ok'); }
     if (text.startsWith('/delete')) { await handleDelete(chatId, text); return res.status(200).send('ok'); }
+    if (text.startsWith('/edit'))   { await handleEdit(chatId);         return res.status(200).send('ok'); }
     if (text.startsWith('/commit')) { await handleCommit(chatId);       return res.status(200).send('ok'); }
     if (text.startsWith('/queue'))  { await handleQueue(chatId);        return res.status(200).send('ok'); }
 
@@ -105,6 +112,14 @@ module.exports = async (req, res) => {
 // ---------------------------------------------------------------------------
 
 async function routeMessage(chatId, message, text) {
+  // If the user is mid-edit and just sent text, treat that as the new value
+  // for the field they picked. Edit takes priority over add-flow text.
+  const editSession = EDIT_SESSIONS.get(chatId);
+  if (editSession?.pendingField && text && !extractIncomingMedia(message)) {
+    await applyEditValue(chatId, editSession, text);
+    return;
+  }
+
   const session  = getSession(chatId);
   const incoming = extractIncomingMedia(message);
 
@@ -178,13 +193,17 @@ async function routeMessage(chatId, message, text) {
     case 'location':    return onLocation(chatId, session, text);
     case 'badge':       return onBadge(chatId, session, text);
     case 'yearStarted': return onYearStarted(chatId, session, text);
-    case 'plots':       return onPlots(chatId, session, text);
+    case 'plots':          return onPlots(chatId, session, text);
+    case 'plotsTotal':     return onPlotsTotal(chatId, session, text);
+    case 'plotsSold':      return onPlotsSold(chatId, session, text);
+    case 'plotsAvailable': return onPlotsAvailable(chatId, session, text);
     case 'areaSqft':    return onAreaSqft(chatId, session, text);
     case 'price':       return onPrice(chatId, session, text);
     case 'mapLink':     return onMapLink(chatId, session, text);
     case 'amenities':   return onAmenities(chatId, session, text);
     case 'tagline':     return onTagline(chatId, session, text);
     case 'description': return onDescription(chatId, session, text);
+    case 'youtubeId':   return onYouTubeId(chatId, session, text);
     case 'more':        return onMore(chatId, session, text);
     default:
       await sendMessage(chatId, helpText());
@@ -208,8 +227,8 @@ async function onName(chatId, session, text) {
     [
       [{ text: '🔨 Ongoing',    callback_data: 'cat:Ongoing'    },
        { text: '📍 Karaikal',   callback_data: 'cat:Karaikal'   }],
-      [{ text: '🏙 Chennai',    callback_data: 'cat:Chennai'    },
-       { text: '🔁 Renovation', callback_data: 'cat:Renovation' }],
+      [{ text: '🗺 Plots for Sale', callback_data: 'cat:PlotLayout' },
+       { text: '🔁 Renovation',     callback_data: 'cat:Renovation' }],
       [{ text: '📦 Other',      callback_data: 'cat:Other'      }],
     ]
   );
@@ -244,6 +263,22 @@ async function onYearStarted(chatId, session, text) {
 
 async function onPlots(chatId, session, text) {
   if (!isSkip(text)) session.current.plots = text.replace(/\s+/g, ' ').trim();
+  // For PlotLayout, branch into the inventory questions before area/price.
+  await goToStep(chatId, session, isPlotLayout(session) ? 'plotsTotal' : 'areaSqft');
+}
+
+async function onPlotsTotal(chatId, session, text) {
+  if (!isSkip(text)) session.current.plotsTotal = text.replace(/\s+/g, ' ').trim();
+  await goToStep(chatId, session, 'plotsSold');
+}
+
+async function onPlotsSold(chatId, session, text) {
+  if (!isSkip(text)) session.current.plotsSold = text.replace(/\s+/g, ' ').trim();
+  await goToStep(chatId, session, 'plotsAvailable');
+}
+
+async function onPlotsAvailable(chatId, session, text) {
+  if (!isSkip(text)) session.current.plotsAvailable = text.replace(/\s+/g, ' ').trim();
   await goToStep(chatId, session, 'areaSqft');
 }
 
@@ -277,6 +312,20 @@ async function onTagline(chatId, session, text) {
 
 async function onDescription(chatId, session, text) {
   if (!isSkip(text)) session.current.description = text.trim();
+  await goToStep(chatId, session, 'youtubeId');
+}
+
+async function onYouTubeId(chatId, session, text) {
+  if (!isSkip(text)) {
+    const id = parseYouTubeId(text);
+    if (!id) {
+      await sendMessage(chatId,
+        'That doesn\'t look like a YouTube link. Send a full URL (https://youtu.be/… or https://www.youtube.com/watch?v=…), the bare 11-char video ID, or tap Skip.'
+      );
+      return;
+    }
+    session.current.youtubeId = id;
+  }
   await goToStep(chatId, session, 'gallery');
 }
 
@@ -295,15 +344,20 @@ async function onMore(chatId, session, text) {
 // ---------------------------------------------------------------------------
 
 const STEP_PROMPTS = {
-  badge:       { text: `*4 / 12*  *Badge text*?  (optional)\n\nSmall crimson pill — e.g. "42 Plots", "Sold Out". Send or tap Skip.` },
-  yearStarted: { text: `*5 / 12*  *Year started*?  (optional)\n\nE.g. 2022. Send or tap Skip.` },
-  plots:       { text: `*6 / 12*  *Number of plots*?  (optional)\n\nE.g. 42. Send or tap Skip.` },
-  areaSqft:    { text: `*7 / 12*  *Plot area (sqft)*?  (optional)\n\nE.g. "1200 – 2400". Send or tap Skip.` },
+  badge:          { text: `*4 / 12*  *Badge text*?  (optional)\n\nSmall crimson pill — e.g. "42 Plots", "Sold Out". Send or tap Skip.` },
+  yearStarted:    { text: `*5 / 12*  *Year started*?  (optional)\n\nE.g. 2022. Send or tap Skip.` },
+  plots:          { text: `*6 / 12*  *Number of plots*?  (optional)\n\nE.g. 42. Send or tap Skip.` },
+  // Plot-layout-only inventory questions (only reached when category === PlotLayout).
+  plotsTotal:     { text: `*Plot inventory — Total plots*?  (optional)\n\nHow many plots are in this layout in total? E.g. 24. Send or tap Skip.` },
+  plotsSold:      { text: `*Plot inventory — Plots sold*?  (optional)\n\nHow many plots have been sold so far? E.g. 17. Send or tap Skip.` },
+  plotsAvailable: { text: `*Plot inventory — Plots available*?  (optional)\n\nHow many plots are still available for buyers? E.g. 7. Send or tap Skip.` },
+  areaSqft:       { text: `*7 / 12*  *Plot area (sqft)*?  (optional)\n\nE.g. "1200 – 2400". Send or tap Skip.` },
   price:       { text: `*8 / 12*  *Starting price*?  (optional)\n\nE.g. "From ₹48 L". Send or tap Skip.` },
   mapLink:     { text: `*9 / 12*  *Google Maps link*?  (optional)\n\nPaste the link or tap Skip.` },
   amenities:   { text: `*10 / 12*  *Amenities*?  (optional)\n\nComma-separated: _Gated community, 30ft roads, Solar lighting_\n\nOr tap Skip.` },
   tagline:     { text: `*11 / 12*  *Property tagline*?  (optional)\n\nE.g. _"A garden address, a forever home"_\n\nSend or tap Skip.` },
   description: { text: `*12 / 12*  *Property description*?  (optional)\n\nA few sentences about the property. Plain text. Send or tap Skip.` },
+  youtubeId:   { text: `*Property walkthrough video*?  (optional)\n\nPaste a YouTube link (https://youtu.be/… or https://www.youtube.com/watch?v=…) or the 11-char video ID. The video shows on the property page.\n\nLeave it for later? Tap Skip.` },
 };
 
 function skipKeyboard(step) {
@@ -415,9 +469,15 @@ async function handleCallbackQuery(cq) {
       location: 'badge', badge: 'yearStarted', yearStarted: 'plots',
       plots: 'areaSqft', areaSqft: 'price', price: 'mapLink',
       mapLink: 'amenities', amenities: 'tagline', tagline: 'description',
-      description: 'gallery',
+      description: 'youtubeId', youtubeId: 'gallery',
+      // PlotLayout-only chain — skip jumps within the inventory trio and back
+      // out to areaSqft when the user skips the last one.
+      plotsTotal: 'plotsSold', plotsSold: 'plotsAvailable', plotsAvailable: 'areaSqft',
     };
-    const nextStep = NEXT[step];
+    // For 'plots' specifically, route into the inventory chain when this is a
+    // PlotLayout property — otherwise stay on the generic path.
+    let nextStep = NEXT[step];
+    if (step === 'plots' && isPlotLayout(session)) nextStep = 'plotsTotal';
     if (!nextStep) return;
 
     await editMessage(chatId, messageId, `${prettyStepName(step)}: _skipped_`);
@@ -480,6 +540,12 @@ async function handleCallbackQuery(cq) {
   // ── Delete flow ───────────────────────────────────────────────────────────
   if (data.startsWith('del:')) {
     await handleDeleteCallback(chatId, messageId, data.slice(4));
+    return;
+  }
+
+  // ── Edit flow ─────────────────────────────────────────────────────────────
+  if (data.startsWith('edit:')) {
+    await handleEditCallback(chatId, messageId, data.slice(5));
     return;
   }
 }
@@ -650,10 +716,14 @@ function buildMarkdown(item) {
   if (item.location)    fm.push(`location: ${item.location}`);
   if (item.badge)       fm.push(`badge: ${item.badge}`);
   if (item.yearStarted) fm.push(`yearStarted: ${item.yearStarted}`);
-  if (item.plots)       fm.push(`plots: ${item.plots}`);
+  if (item.plots)          fm.push(`plots: ${item.plots}`);
+  if (item.plotsTotal)     fm.push(`plotsTotal: ${item.plotsTotal}`);
+  if (item.plotsSold)      fm.push(`plotsSold: ${item.plotsSold}`);
+  if (item.plotsAvailable) fm.push(`plotsAvailable: ${item.plotsAvailable}`);
   if (item.areaSqft)    fm.push(`areaSqft: ${item.areaSqft}`);
   if (item.price)       fm.push(`price: ${item.price}`);
   if (item.mapLink)     fm.push(`mapLink: ${item.mapLink}`);
+  if (item.youtubeId)   fm.push(`youtubeId: ${item.youtubeId}`);
   if (item.isReno)      fm.push(`isRenovation: true`);
   if (item.amenities && item.amenities.length > 0) {
     fm.push(`amenities:`);
@@ -682,10 +752,14 @@ function finaliseItem(current) {
     location:     current.location     || null,
     badge:        current.badge        || null,
     yearStarted:  current.yearStarted  || null,
-    plots:        current.plots        || null,
+    plots:           current.plots          || null,
+    plotsTotal:      current.plotsTotal     || null,
+    plotsSold:       current.plotsSold      || null,
+    plotsAvailable:  current.plotsAvailable || null,
     areaSqft:     current.areaSqft     || null,
     price:        current.price        || null,
     mapLink:      current.mapLink      || null,
+    youtubeId:    current.youtubeId    || null,
     amenities:    current.amenities    || [],
     tagline:      current.tagline      || null,
     description:  current.description  || null,
@@ -904,6 +978,460 @@ async function showPhotoDeleteMenu(chatId, messageId, projSlug, backCallback) {
   await editMessageWithKeyboard(chatId, messageId, `Which photo from *${titleCase(projSlug)}*?`, keyboard);
 }
 
+// ---------------------------------------------------------------------------
+// Edit flow — pick category → project → field → enter value → done
+// ---------------------------------------------------------------------------
+
+const EDITABLE_CATEGORIES = [
+  { key: 'Ongoing',    label: '🔨 Ongoing'        },
+  { key: 'Karaikal',   label: '📍 Karaikal'       },
+  { key: 'PlotLayout', label: '🗺 Plots for Sale' },
+  { key: 'Renovation', label: '🔁 Renovation'     },
+  { key: 'Other',      label: '📦 Other'          },
+];
+
+// Common editable fields. PlotLayout adds three more — see editableFieldsFor.
+const EDIT_FIELDS_BASE = [
+  { key: 'name',        label: '📝 Name'        },
+  { key: 'location',    label: '📍 Location'    },
+  { key: 'badge',       label: '🏷 Badge'        },
+  { key: 'yearStarted', label: '📅 Year started'},
+  { key: 'plots',       label: '🔢 Plots count' },
+  { key: 'areaSqft',    label: '📐 Area (sqft)' },
+  { key: 'price',       label: '💰 Price'       },
+  { key: 'mapLink',     label: '🗺 Map link'    },
+  { key: 'amenities',   label: '✨ Amenities'   },
+  { key: 'tagline',     label: '💬 Tagline'     },
+  { key: 'description', label: '📖 Description' },
+  { key: 'youtubeId',   label: '▶️ YouTube video'},
+];
+
+const EDIT_FIELDS_PLOTLAYOUT = [
+  { key: 'plotsTotal',     label: '🔢 Total plots'     },
+  { key: 'plotsSold',      label: '✅ Plots sold'      },
+  { key: 'plotsAvailable', label: '🏷 Plots available' },
+];
+
+function editableFieldsFor(category) {
+  if (category === 'PlotLayout') {
+    // Insert the inventory trio right after "Plots count" so they cluster.
+    const idx = EDIT_FIELDS_BASE.findIndex(f => f.key === 'plots');
+    return [
+      ...EDIT_FIELDS_BASE.slice(0, idx + 1),
+      ...EDIT_FIELDS_PLOTLAYOUT,
+      ...EDIT_FIELDS_BASE.slice(idx + 1),
+    ];
+  }
+  return EDIT_FIELDS_BASE;
+}
+
+async function handleEdit(chatId) {
+  // Reset any prior edit session for this chat.
+  EDIT_SESSIONS.delete(chatId);
+  EDIT_TOKENS.delete(chatId);
+  await sendMessageWithKeyboard(chatId,
+    `Edit a project, Sharik. Which *category* is it in?`,
+    [
+      ...EDITABLE_CATEGORIES.map(c => [{ text: c.label, callback_data: `edit:cat:${c.key}` }]),
+      [{ text: '✕ Cancel', callback_data: 'edit:cancel' }],
+    ]
+  );
+}
+
+async function handleEditCallback(chatId, messageId, payload) {
+  if (payload === 'cancel') {
+    EDIT_SESSIONS.delete(chatId);
+    EDIT_TOKENS.delete(chatId);
+    await editMessage(chatId, messageId, 'Edit cancelled.');
+    return;
+  }
+
+  if (payload === 'back') {
+    EDIT_SESSIONS.delete(chatId);
+    EDIT_TOKENS.delete(chatId);
+    await editMessageWithKeyboard(chatId, messageId,
+      `Edit a project, Sharik. Which *category* is it in?`,
+      [
+        ...EDITABLE_CATEGORIES.map(c => [{ text: c.label, callback_data: `edit:cat:${c.key}` }]),
+        [{ text: '✕ Cancel', callback_data: 'edit:cancel' }],
+      ]
+    );
+    return;
+  }
+
+  if (payload.startsWith('cat:')) {
+    const cat = payload.slice(4);
+    await showEditProjectMenu(chatId, messageId, cat);
+    return;
+  }
+
+  if (payload.startsWith('proj:')) {
+    const token = payload.slice(5);
+    const filePath = ensureEditTokens(chatId).get(token);
+    if (!filePath) { await editMessage(chatId, messageId, 'Selection expired. Run /edit again.'); return; }
+    await loadEditProject(chatId, messageId, filePath);
+    return;
+  }
+
+  if (payload.startsWith('field:')) {
+    const field = payload.slice(6);
+    const session = EDIT_SESSIONS.get(chatId);
+    if (!session) { await editMessage(chatId, messageId, 'Edit session expired. Run /edit again.'); return; }
+    session.pendingField = field;
+    touch(session);
+    const current = readEditField(session, field);
+    const currentLine = current ? `\n\n_Current:_ ${truncate(current, 140)}` : '\n\n_Currently empty._';
+    const hint = field === 'amenities'
+      ? 'Send a comma-separated list, e.g. _Gated community, 30ft roads, Solar lighting_.'
+      : field === 'description'
+      ? 'Send the new description as plain text. It replaces the existing description body.'
+      : field === 'mapLink'
+      ? 'Send a full URL starting with http.'
+      : field === 'youtubeId'
+      ? 'Paste a YouTube link (youtu.be/… or youtube.com/watch?v=…) or the 11-char ID.'
+      : 'Send the new value as plain text.';
+    await editMessageWithKeyboard(chatId, messageId,
+      `Editing *${prettyEditField(field)}* for *${session.fm.name || session.slug}*.\n\n${hint}${currentLine}`,
+      [
+        [{ text: '🗑 Clear this field', callback_data: 'edit:clearfield' }],
+        [{ text: '↩ Pick another field', callback_data: 'edit:pickfield' }],
+        [{ text: '✕ Cancel',             callback_data: 'edit:cancel'    }],
+      ]
+    );
+    return;
+  }
+
+  if (payload === 'clearfield') {
+    const session = EDIT_SESSIONS.get(chatId);
+    if (!session?.pendingField) { await editMessage(chatId, messageId, 'No field selected.'); return; }
+    await applyEditValue(chatId, session, '', { fromButton: true, messageId });
+    return;
+  }
+
+  if (payload === 'pickfield') {
+    const session = EDIT_SESSIONS.get(chatId);
+    if (!session) { await editMessage(chatId, messageId, 'Edit session expired.'); return; }
+    session.pendingField = null;
+    touch(session);
+    await renderEditFieldMenu(chatId, messageId, session);
+    return;
+  }
+
+  if (payload === 'commit') {
+    const session = EDIT_SESSIONS.get(chatId);
+    if (!session) { await editMessage(chatId, messageId, 'Edit session expired.'); return; }
+    await commitEdit(chatId, messageId, session);
+    return;
+  }
+}
+
+async function showEditProjectMenu(chatId, messageId, category) {
+  let entries;
+  try {
+    const r = await axios.get(
+      `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GH_CONTENTS_PATH}`,
+      { headers: ghHeaders(), params: { ref: GITHUB_BRANCH } }
+    );
+    entries = Array.isArray(r.data) ? r.data : [];
+  } catch (e) {
+    if (e?.response?.status === 404) { await editMessage(chatId, messageId, 'No projects to edit.'); return; }
+    throw e;
+  }
+  const folders = entries.filter(e => e.type === 'dir').sort((a, b) => a.name.localeCompare(b.name));
+  if (folders.length === 0) { await editMessage(chatId, messageId, 'No projects to edit.'); return; }
+
+  // Open each .md and filter by frontmatter category.
+  const tokens = ensureEditTokens(chatId);
+  tokens.clear();
+  const matches = [];
+  let counter = 0;
+  for (const f of folders) {
+    const mdPath = `${GH_CONTENTS_PATH}/${f.name}/${f.name}.md`;
+    try {
+      const md = await fetchTextFile(mdPath);
+      if (!md) continue;
+      const { data } = parseFrontmatter(md.content);
+      const cat = String(data.category || '').toLowerCase();
+      if (categoryMatches(cat, category)) {
+        const key = String(counter++);
+        tokens.set(key, mdPath);
+        matches.push({ key, label: data.name || titleCase(f.name) });
+      }
+    } catch { /* skip */ }
+  }
+
+  if (matches.length === 0) {
+    await editMessageWithKeyboard(chatId, messageId,
+      `No *${category}* projects found.`,
+      [
+        [{ text: '↩ Pick another category', callback_data: 'edit:back' }],
+        [{ text: '✕ Cancel',                callback_data: 'edit:cancel' }],
+      ]
+    );
+    // Allow back-tap to re-open the category picker.
+    EDIT_SESSIONS.set(chatId, { pickingCategory: true, updatedAt: Date.now() });
+    return;
+  }
+
+  const keyboard = matches.map(m => [{ text: m.label, callback_data: `edit:proj:${m.key}` }]);
+  keyboard.push([{ text: '✕ Cancel', callback_data: 'edit:cancel' }]);
+  await editMessageWithKeyboard(chatId, messageId,
+    `*${category}* projects — pick one to edit:`,
+    keyboard
+  );
+}
+
+async function loadEditProject(chatId, messageId, mdPath) {
+  await editMessage(chatId, messageId, 'Loading...');
+  const md = await fetchTextFile(mdPath);
+  if (!md) { await editMessage(chatId, messageId, 'Could not load this project.'); return; }
+  const { data, content } = parseFrontmatter(md.content);
+  const slug = mdPath.split('/').slice(-2, -1)[0];
+  const session = {
+    slug,
+    mdPath,
+    sha: md.sha,
+    fm: { ...data },
+    body: content,
+    category: String(data.category || ''),
+    pendingField: null,
+    dirty: false,
+    updatedAt: Date.now(),
+  };
+  EDIT_SESSIONS.set(chatId, session);
+  await renderEditFieldMenu(chatId, messageId, session);
+}
+
+async function renderEditFieldMenu(chatId, messageId, session) {
+  const fields = editableFieldsFor(session.category);
+  const keyboard = [];
+  for (let i = 0; i < fields.length; i += 2) {
+    const row = [{ text: fields[i].label, callback_data: `edit:field:${fields[i].key}` }];
+    if (fields[i + 1]) row.push({ text: fields[i + 1].label, callback_data: `edit:field:${fields[i + 1].key}` });
+    keyboard.push(row);
+  }
+  keyboard.push([
+    session.dirty
+      ? { text: '🚀 Save & publish', callback_data: 'edit:commit' }
+      : { text: '✓ Done (no changes)', callback_data: 'edit:cancel' },
+  ]);
+  keyboard.push([{ text: '✕ Cancel', callback_data: 'edit:cancel' }]);
+
+  const dirtyTag = session.dirty ? '\n\n_Unsaved changes — tap Save & publish when done._' : '';
+  await editMessageWithKeyboard(chatId, messageId,
+    `Editing *${session.fm.name || session.slug}*\nCategory: *${session.category}*${dirtyTag}\n\nPick a field to update:`,
+    keyboard
+  );
+}
+
+async function applyEditValue(chatId, session, rawText, opts = {}) {
+  const field = session.pendingField;
+  if (!field) return;
+
+  const value = rawText.trim();
+  // Empty / explicit clear → unset the field. For description, that means
+  // empty body. For other frontmatter keys, delete the key.
+  const clearing = opts.fromButton ? true : value === '' || isSkip(value);
+
+  if (field === 'description') {
+    session.body = clearing ? '' : value;
+  } else if (field === 'amenities') {
+    if (clearing) delete session.fm.amenities;
+    else session.fm.amenities = value.split(',').map(s => s.trim()).filter(Boolean);
+  } else if (field === 'name') {
+    if (clearing) {
+      await sendMessage(chatId, 'Name cannot be empty. Please send a value or pick a different field.');
+      return;
+    }
+    if (!/[A-Za-z0-9]/.test(value) || value.length > 60) {
+      await sendMessage(chatId, 'Name must be 1–60 chars and contain a letter or number.');
+      return;
+    }
+    session.fm.name = value;
+  } else if (field === 'mapLink') {
+    if (clearing) delete session.fm.mapLink;
+    else if (!value.startsWith('http')) {
+      await sendMessage(chatId, 'Please send a URL starting with http, or tap Clear.');
+      return;
+    } else session.fm.mapLink = value;
+  } else if (field === 'youtubeId') {
+    if (clearing) delete session.fm.youtubeId;
+    else {
+      const id = parseYouTubeId(value);
+      if (!id) {
+        await sendMessage(chatId, 'Not a valid YouTube link or ID. Send a watch URL, youtu.be link, or the 11-char ID.');
+        return;
+      }
+      session.fm.youtubeId = id;
+    }
+  } else if (field === 'yearStarted') {
+    if (clearing) delete session.fm.yearStarted;
+    else if (!/^\d{4}$/.test(value)) {
+      await sendMessage(chatId, 'Year should be 4 digits like 2022.');
+      return;
+    } else session.fm.yearStarted = value;
+  } else {
+    if (clearing) delete session.fm[field];
+    else session.fm[field] = value;
+  }
+
+  session.pendingField = null;
+  session.dirty = true;
+  touch(session);
+
+  if (opts.fromButton && opts.messageId) {
+    await editMessage(chatId, opts.messageId, `*${prettyEditField(field)}* cleared ✓`);
+  } else {
+    await sendMessage(chatId, `*${prettyEditField(field)}* updated ✓`);
+  }
+  // Re-render the field menu so the user can pick another or save.
+  await sendMessageWithKeyboard(chatId,
+    `Editing *${session.fm.name || session.slug}* — pick another field or save:`,
+    [
+      ...editableFieldsFor(session.category).reduce((rows, f, i) => {
+        if (i % 2 === 0) rows.push([{ text: f.label, callback_data: `edit:field:${f.key}` }]);
+        else rows[rows.length - 1].push({ text: f.label, callback_data: `edit:field:${f.key}` });
+        return rows;
+      }, []),
+      [{ text: '🚀 Save & publish', callback_data: 'edit:commit' }],
+      [{ text: '✕ Cancel',          callback_data: 'edit:cancel' }],
+    ]
+  );
+}
+
+async function commitEdit(chatId, messageId, session) {
+  await editMessage(chatId, messageId, 'Publishing changes...');
+  try {
+    const newMd = serialiseMarkdown(session.fm, session.body);
+    await axios.put(
+      ghContentsUrlFull(session.mdPath),
+      {
+        message: `Edit project: ${session.fm.name || session.slug}`,
+        content: Buffer.from(newMd, 'utf8').toString('base64'),
+        sha:     session.sha,
+        branch:  GITHUB_BRANCH,
+      },
+      { headers: ghHeaders() }
+    );
+    await axios.get(VERCEL_DEPLOY_HOOK).catch(e => console.error('Deploy hook failed:', e.message));
+    EDIT_SESSIONS.delete(chatId);
+    EDIT_TOKENS.delete(chatId);
+    await editMessage(chatId, messageId,
+      `✓ *${session.fm.name || session.slug}* updated. Site refreshes in ~60s.`
+    );
+  } catch (e) {
+    await editMessage(chatId, messageId, `Failed: ${e?.response?.data?.message || e.message}`);
+  }
+}
+
+// Fetch a text file from the repo. Returns { content, sha } or null on 404.
+async function fetchTextFile(path) {
+  try {
+    const r = await axios.get(ghContentsUrlFull(path), {
+      headers: ghHeaders(),
+      params: { ref: GITHUB_BRANCH },
+    });
+    const content = Buffer.from(r.data.content, 'base64').toString('utf8');
+    return { content, sha: r.data.sha };
+  } catch (e) {
+    if (e?.response?.status === 404) return null;
+    throw e;
+  }
+}
+
+// Lightweight YAML frontmatter parser — only handles the keys the bot writes.
+// Supports scalars and a single-level "amenities:\n  - x\n  - y" list. That's
+// all our markdown produces, so we don't need full YAML.
+function parseFrontmatter(raw) {
+  const m = raw.match(/^---\s*\r?\n([\s\S]*?)\r?\n---\s*\r?\n?([\s\S]*)$/);
+  if (!m) return { data: {}, content: raw };
+  const data = {};
+  const lines = m[1].split(/\r?\n/);
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const kv = line.match(/^([A-Za-z0-9_]+)\s*:\s*(.*)$/);
+    if (!kv) { i++; continue; }
+    const key = kv[1];
+    const val = kv[2];
+    if (val === '') {
+      // Possibly a list — gather subsequent "- item" lines.
+      const items = [];
+      let j = i + 1;
+      while (j < lines.length && /^\s*-\s+/.test(lines[j])) {
+        items.push(lines[j].replace(/^\s*-\s+/, '').trim());
+        j++;
+      }
+      if (items.length > 0) { data[key] = items; i = j; continue; }
+    }
+    data[key] = val;
+    i++;
+  }
+  return { data, content: m[2] || '' };
+}
+
+// Re-emit YAML frontmatter + body in the same shape buildMarkdown produces,
+// so the file stays consistent across add and edit.
+function serialiseMarkdown(fm, body) {
+  const out = ['---'];
+  // Preserve a sensible field order — same order buildMarkdown writes new files.
+  const order = [
+    'name', 'category', 'location', 'badge', 'yearStarted', 'plots',
+    'plotsTotal', 'plotsSold', 'plotsAvailable',
+    'areaSqft', 'price', 'mapLink', 'youtubeId', 'isRenovation',
+  ];
+  for (const k of order) {
+    if (fm[k] === undefined || fm[k] === null || fm[k] === '') continue;
+    out.push(`${k}: ${fm[k]}`);
+  }
+  if (Array.isArray(fm.amenities) && fm.amenities.length > 0) {
+    out.push('amenities:');
+    for (const a of fm.amenities) out.push(`  - ${a}`);
+  }
+  out.push('---');
+  const trimmedBody = (body || '').replace(/^\s+/, '');
+  return trimmedBody ? `${out.join('\n')}\n\n${trimmedBody}` : out.join('\n') + '\n';
+}
+
+function readEditField(session, field) {
+  if (field === 'description') return session.body || '';
+  if (field === 'amenities') {
+    const a = session.fm.amenities;
+    return Array.isArray(a) ? a.join(', ') : (a || '');
+  }
+  return session.fm[field] || '';
+}
+
+function prettyEditField(field) {
+  const map = {
+    name: 'Name', location: 'Location', badge: 'Badge', yearStarted: 'Year started',
+    plots: 'Plots count', plotsTotal: 'Total plots', plotsSold: 'Plots sold',
+    plotsAvailable: 'Plots available', areaSqft: 'Area (sqft)', price: 'Price',
+    mapLink: 'Map link', amenities: 'Amenities', tagline: 'Tagline', description: 'Description',
+    youtubeId: 'YouTube video',
+  };
+  return map[field] || field;
+}
+
+function categoryMatches(raw, target) {
+  // Same loose matching the website uses, so users don't have to remember the
+  // exact casing in the .md file.
+  const r = raw.toLowerCase();
+  if (target === 'PlotLayout') return ['plotlayout', 'plot-layout', 'plot_layout', 'plot', 'plots', 'available', 'available-plots'].includes(r);
+  return r === target.toLowerCase();
+}
+
+function ensureEditTokens(chatId) {
+  let m = EDIT_TOKENS.get(chatId);
+  if (!m) { m = new Map(); EDIT_TOKENS.set(chatId, m); }
+  return m;
+}
+
+function truncate(s, n) {
+  const str = String(s);
+  return str.length > n ? str.slice(0, n - 1) + '…' : str;
+}
+
 async function deleteFolderContents(projSlug) {
   const r = await axios.get(
     `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GH_CONTENTS_PATH}/${projSlug}`,
@@ -971,8 +1499,40 @@ function titleCase(s) { return s.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUp
 function isSkip(text) { return SKIP_TOKENS.includes((text || '').toLowerCase().trim()); }
 
 function prettyStepName(step) {
-  const map = { location: 'Location', badge: 'Badge', yearStarted: 'Year started', plots: 'Plots', areaSqft: 'Area', price: 'Price', mapLink: 'Map link', amenities: 'Amenities', tagline: 'Tagline', description: 'Description' };
+  const map = {
+    location: 'Location', badge: 'Badge', yearStarted: 'Year started',
+    plots: 'Plots', plotsTotal: 'Total plots', plotsSold: 'Plots sold',
+    plotsAvailable: 'Plots available',
+    areaSqft: 'Area', price: 'Price', mapLink: 'Map link',
+    amenities: 'Amenities', tagline: 'Tagline', description: 'Description',
+    youtubeId: 'YouTube video',
+  };
   return map[step] || step;
+}
+
+// Pull the 11-char video ID out of any of the common YouTube URL shapes, or
+// pass a bare ID through. Mirrors the website's extractYouTubeId so the bot
+// stores exactly what the loader expects.
+function parseYouTubeId(raw) {
+  if (typeof raw !== 'string') return null;
+  const s = raw.trim();
+  if (!s) return null;
+  if (/^[A-Za-z0-9_-]{11}$/.test(s)) return s;
+  const patterns = [
+    /youtu\.be\/([A-Za-z0-9_-]{11})/,
+    /[?&]v=([A-Za-z0-9_-]{11})/,
+    /\/embed\/([A-Za-z0-9_-]{11})/,
+    /\/shorts\/([A-Za-z0-9_-]{11})/,
+  ];
+  for (const re of patterns) {
+    const m = s.match(re);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+function isPlotLayout(session) {
+  return session?.current?.category === 'PlotLayout';
 }
 
 function extractIncomingMedia(message) {
@@ -1012,6 +1572,7 @@ function helpText() {
     '  /queue  — see what\'s waiting to publish\n' +
     '  /commit — publish the queue now\n' +
     '  /cancel — clear everything and start over\n' +
+    '  /edit   — edit details of a published project\n' +
     '  /delete — remove a project or photo\n' +
     '  /help   — this message'
   );
