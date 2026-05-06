@@ -98,6 +98,7 @@ module.exports = async (req, res) => {
     if (text.startsWith('/edit'))   { await handleEdit(chatId);         return res.status(200).send('ok'); }
     if (text.startsWith('/commit')) { await handleCommit(chatId);       return res.status(200).send('ok'); }
     if (text.startsWith('/queue'))  { await handleQueue(chatId);        return res.status(200).send('ok'); }
+    if (text.startsWith('/refresh')) { await handleRefresh(chatId);     return res.status(200).send('ok'); }
 
     await routeMessage(chatId, message, text);
     return res.status(200).send('ok');
@@ -274,12 +275,34 @@ async function onPlotsTotal(chatId, session, text) {
 
 async function onPlotsSold(chatId, session, text) {
   if (!isSkip(text)) session.current.plotsSold = text.replace(/\s+/g, ' ').trim();
-  await goToStep(chatId, session, 'plotsAvailable');
+  // The website derives "available" from total - sold whenever both parse as
+  // numbers, so we only ask for plotsAvailable when one of them is non-numeric
+  // (e.g. "Sold out", "12+") and the math can't be done.
+  await goToStep(chatId, session, needsManualAvailable(session) ? 'plotsAvailable' : 'areaSqft');
 }
 
 async function onPlotsAvailable(chatId, session, text) {
   if (!isSkip(text)) session.current.plotsAvailable = text.replace(/\s+/g, ' ').trim();
   await goToStep(chatId, session, 'areaSqft');
+}
+
+// True only when we couldn't derive available = total - sold from numeric
+// values — i.e. one of them is missing or non-numeric.
+function needsManualAvailable(session) {
+  const c = session?.current || {};
+  const totalN = parseLooseNumber(c.plotsTotal);
+  const soldN = parseLooseNumber(c.plotsSold);
+  return totalN === null || soldN === null;
+}
+
+function parseLooseNumber(v) {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  // Reject strings like "12+", "Sold out" — only accept clean integers/decimals.
+  if (!/^-?\d+(\.\d+)?$/.test(s)) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
 }
 
 async function onAreaSqft(chatId, session, text) {
@@ -349,8 +372,8 @@ const STEP_PROMPTS = {
   plots:          { text: `*6 / 12*  *Number of plots*?  (optional)\n\nE.g. 42. Send or tap Skip.` },
   // Plot-layout-only inventory questions (only reached when category === PlotLayout).
   plotsTotal:     { text: `*Plot inventory — Total plots*?  (optional)\n\nHow many plots are in this layout in total? E.g. 24. Send or tap Skip.` },
-  plotsSold:      { text: `*Plot inventory — Plots sold*?  (optional)\n\nHow many plots have been sold so far? E.g. 17. Send or tap Skip.` },
-  plotsAvailable: { text: `*Plot inventory — Plots available*?  (optional)\n\nHow many plots are still available for buyers? E.g. 7. Send or tap Skip.` },
+  plotsSold:      { text: `*Plot inventory — Plots sold*?  (optional)\n\nHow many plots have been sold so far? E.g. 17.\n\n_If both Total and Sold are numbers, I'll calculate Available for you automatically._` },
+  plotsAvailable: { text: `*Plot inventory — Plots available*?  (optional)\n\nI need this only because Total or Sold isn't a clean number — couldn't calculate it. E.g. "Sold out" or 7. Send or tap Skip.` },
   areaSqft:       { text: `*7 / 12*  *Plot area (sqft)*?  (optional)\n\nE.g. "1200 – 2400". Send or tap Skip.` },
   price:       { text: `*8 / 12*  *Starting price*?  (optional)\n\nE.g. "From ₹48 L". Send or tap Skip.` },
   mapLink:     { text: `*9 / 12*  *Google Maps link*?  (optional)\n\nPaste the link or tap Skip.` },
@@ -472,12 +495,15 @@ async function handleCallbackQuery(cq) {
       description: 'youtubeId', youtubeId: 'gallery',
       // PlotLayout-only chain — skip jumps within the inventory trio and back
       // out to areaSqft when the user skips the last one.
-      plotsTotal: 'plotsSold', plotsSold: 'plotsAvailable', plotsAvailable: 'areaSqft',
+      plotsTotal: 'plotsSold', plotsAvailable: 'areaSqft',
     };
     // For 'plots' specifically, route into the inventory chain when this is a
     // PlotLayout property — otherwise stay on the generic path.
     let nextStep = NEXT[step];
     if (step === 'plots' && isPlotLayout(session)) nextStep = 'plotsTotal';
+    // After skipping plotsSold, only ask plotsAvailable when total/sold can't
+    // be calculated arithmetically; otherwise the website will derive it.
+    if (step === 'plotsSold') nextStep = needsManualAvailable(session) ? 'plotsAvailable' : 'areaSqft';
     if (!nextStep) return;
 
     await editMessage(chatId, messageId, `${prettyStepName(step)}: _skipped_`);
@@ -768,6 +794,21 @@ function finaliseItem(current) {
 }
 
 // ---------------------------------------------------------------------------
+// /refresh — trigger a Vercel rebuild without committing anything. Useful
+// after pushing changes from another tool, or to force a redeploy.
+// ---------------------------------------------------------------------------
+
+async function handleRefresh(chatId) {
+  await sendMessage(chatId, 'Triggering a fresh deploy...');
+  try {
+    await axios.get(VERCEL_DEPLOY_HOOK);
+    await sendMessage(chatId, '✓ Deploy hook fired. Site will refresh in ~60s.');
+  } catch (e) {
+    await sendMessage(chatId, `Deploy hook failed: ${e?.response?.data?.message || e.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // /queue
 // ---------------------------------------------------------------------------
 
@@ -1006,10 +1047,11 @@ const EDIT_FIELDS_BASE = [
   { key: 'youtubeId',   label: '▶️ YouTube video'},
 ];
 
+// Plots available is intentionally NOT here — the website derives it from
+// total - sold. We only expose Total and Sold for editing.
 const EDIT_FIELDS_PLOTLAYOUT = [
-  { key: 'plotsTotal',     label: '🔢 Total plots'     },
-  { key: 'plotsSold',      label: '✅ Plots sold'      },
-  { key: 'plotsAvailable', label: '🏷 Plots available' },
+  { key: 'plotsTotal', label: '🔢 Total plots' },
+  { key: 'plotsSold',  label: '✅ Plots sold'  },
 ];
 
 function editableFieldsFor(category) {
@@ -1574,6 +1616,7 @@ function helpText() {
     '  /cancel — clear everything and start over\n' +
     '  /edit   — edit details of a published project\n' +
     '  /delete — remove a project or photo\n' +
+    '  /refresh — trigger a fresh Vercel deploy\n' +
     '  /help   — this message'
   );
 }
